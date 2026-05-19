@@ -479,7 +479,7 @@ use settings::{Setting, ToggleableSetting};
 use warp_core::semantic_selection::SemanticSelection;
 use warpui::text::SelectionType;
 
-use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
+use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields, MenuVariant};
 use crate::server::telemetry::{BlockLatencyInfo, BootstrappingInfo};
 use crate::terminal::{block_list_element::BlockListMenuSource, prompt};
 use crate::terminal::{color, History, SizeInfo};
@@ -655,6 +655,11 @@ const ONEKEY_CONTEXT_MENU_WIDTH: f32 = 320.;
 const ONEKEY_PROMPT_THROTTLE: Duration = Duration::from_secs(2);
 const ONEKEY_PROMPT_SLIDING_WINDOW_BYTES: usize = 8 * 1024;
 const ONEKEY_PROMPT_BUFFER_HARD_LIMIT: usize = 16 * 1024;
+/// 每条 OneKey 候选行的估算高度(stacked label + padding),用于按候选数量
+/// 推导 Scrollable 菜单的目标高度。仅作启发,不需要像素精确。
+const ONEKEY_MENU_ROW_HEIGHT: f32 = 44.;
+/// OneKey 菜单 Scrollable 区域的最大高度,避免几十/几百条凭据时盖住终端。
+const ONEKEY_MENU_MAX_HEIGHT: f32 = 360.;
 
 /// The minimum amount of mouse-drag to consider a selection to
 /// be a text-selection as opposed to mouse-drag noise.
@@ -15337,6 +15342,17 @@ impl TerminalView {
                     .into_item()
                 })
                 .collect();
+            // 候选可能很多(用户保存了几十/几百台 SSH 服务器),按数量推导
+            // 一个有限高度,并切到 Scrollable,这样方向键导航会自动 scroll-into-view,
+            // 也不会把终端主体盖住。
+            let candidate_count = view.onekey_prompt_candidates.len() as f32;
+            let target_height =
+                (candidate_count * ONEKEY_MENU_ROW_HEIGHT).min(ONEKEY_MENU_MAX_HEIGHT);
+            ctx.update_view(&view.context_menu, |context_menu, _| {
+                context_menu.set_menu_variant(MenuVariant::scrollable());
+                context_menu.set_height(target_height);
+            });
+
             view.show_context_menu(
                 ContextMenuState {
                     menu_type: ContextMenuType::OneKeyPrompt,
@@ -18247,6 +18263,11 @@ impl TerminalView {
         if let Some(state) = self.context_menu_state.take() {
             if matches!(state.menu_type, ContextMenuType::OneKeyPrompt) {
                 self.onekey_prompt_candidates.clear();
+                // 该 `Menu` 实例被各类 ContextMenu 共用,关闭 OneKey 菜单时
+                // 把 variant 切回 Fixed,避免影响后续右键 / Alt-screen 菜单。
+                ctx.update_view(&self.context_menu, |context_menu, _| {
+                    context_menu.set_menu_variant(MenuVariant::Fixed);
+                });
             }
             ctx.notify();
             if should_redetermine_focus {
