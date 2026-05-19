@@ -2401,8 +2401,10 @@ pub struct TerminalView {
         feature = "local_fs",
         not(target_family = "wasm")
     ))]
-    remote_dir_listing_cache:
-        HashMap<PathBuf, Option<std::sync::Arc<crate::util::file::RemoteDirListing>>>,
+    remote_dir_listing_cache: HashMap<
+        (warp_core::SessionId, PathBuf),
+        Option<std::sync::Arc<crate::util::file::RemoteDirListing>>,
+    >,
 
     last_focus_ts: Option<NaiveDateTime>,
     tips_completed: ModelHandle<TipsCompleted>,
@@ -15735,10 +15737,14 @@ impl TerminalView {
         feature = "local_fs",
         not(target_family = "wasm")
     ))]
-    fn remote_clicked_path_is_dir(&self, path: &std::path::Path) -> bool {
+    fn remote_clicked_path_is_dir(
+        &self,
+        session_id: warp_core::SessionId,
+        path: &std::path::Path,
+    ) -> bool {
         path.parent().is_some_and(|parent| {
             self.remote_dir_listing_cache
-                .get(parent)
+                .get(&(session_id, parent.to_path_buf()))
                 .and_then(|entry| entry.as_ref())
                 .is_some_and(|listing| crate::util::file::remote_path_is_dir(path, listing))
         })
@@ -15750,9 +15756,10 @@ impl TerminalView {
     /// 在该远端 shell 会话中执行 `cd <dir>`。
     #[cfg(all(feature = "local_tty", feature = "local_fs"))]
     fn cd_into_remote_directory(&mut self, path: &std::path::Path, ctx: &mut ViewContext<Self>) {
-        let dir = path.to_string_lossy();
+        // 对路径做 shell 转义,防止包含 `"`、`$(...)`、反引号等字符时被远端 shell 执行注入命令。
+        let quoted_dir = shell_words::quote(&path.to_string_lossy()).into_owned();
         self.input.update(ctx, |input, ctx| {
-            input.try_execute_command(format!("cd \"{dir}\"").as_str(), ctx);
+            input.try_execute_command(format!("cd -- {quoted_dir}").as_str(), ctx);
         });
     }
 
@@ -15770,9 +15777,11 @@ impl TerminalView {
         if let Some(host_id) = self.active_session_remote_host_id(ctx) {
             // 远端目录点击:不在编辑器里打开,改为在该远端会话里 `cd` 进去。
             #[cfg(not(target_family = "wasm"))]
-            if self.remote_clicked_path_is_dir(&path) {
-                self.cd_into_remote_directory(&path, ctx);
-                return;
+            if let Some(session_id) = self.active_block_session_id() {
+                if self.remote_clicked_path_is_dir(session_id, &path) {
+                    self.cd_into_remote_directory(&path, ctx);
+                    return;
+                }
             }
             if let Some(remote_path) = Self::remote_path_from_terminal_path(host_id, &path) {
                 ctx.emit(Event::OpenRemoteFileFromTerminal {
@@ -15809,9 +15818,11 @@ impl TerminalView {
         if let Some(host_id) = self.active_session_remote_host_id(ctx) {
             // 远端目录点击:不在编辑器里打开,改为在该远端会话里 `cd` 进去。
             #[cfg(not(target_family = "wasm"))]
-            if self.remote_clicked_path_is_dir(&path) {
-                self.cd_into_remote_directory(&path, ctx);
-                return;
+            if let Some(session_id) = self.active_block_session_id() {
+                if self.remote_clicked_path_is_dir(session_id, &path) {
+                    self.cd_into_remote_directory(&path, ctx);
+                    return;
+                }
             }
             if let Some(remote_path) = Self::remote_path_from_terminal_path(host_id, &path) {
                 ctx.emit(Event::OpenRemoteFileFromTerminal {

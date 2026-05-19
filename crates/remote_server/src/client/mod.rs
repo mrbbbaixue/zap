@@ -412,6 +412,10 @@ impl RemoteServerClient {
     }
 
     /// Sends a buffer edit notification (fire-and-forget) to the remote host.
+    ///
+    // TODO(ssh-remote): `send_notification` 在 `outbound_tx` 关闭时只记日志,
+    // 此处会静默吞掉投递失败,本地 buffer 仍继续推进而 daemon 收不到编辑。
+    // 应改为返回 `Result` 或发失败事件,让 manager 把 buffer 标记为未同步。
     pub fn send_buffer_edit(
         &self,
         path: String,

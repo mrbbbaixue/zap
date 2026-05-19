@@ -367,8 +367,14 @@ impl ServerModel {
                     let Some(conns) = me.buffers.connections_for_buffer(file_id) else {
                         return;
                     };
-                    // Find the path for this file_id.
-                    let path = me.buffers.path_for_file_id(*file_id).unwrap_or_default();
+                    // Find the path for this file_id; abort the push if tracker
+                    // state is inconsistent (空 path 会破坏 path↔buffer 契约)。
+                    let Some(path) = me.buffers.path_for_file_id(*file_id) else {
+                        log::error!(
+                            "Missing path mapping for server-local buffer file_id={file_id:?}"
+                        );
+                        return;
+                    };
 
                     let proto_edits: Vec<TextEdit> = edits
                         .iter()
@@ -1297,8 +1303,8 @@ impl ServerModel {
         ctx: &mut ModelContext<Self>,
     ) -> HandlerOutcome {
         log::info!(
-            "Handling OpenBuffer path={} (request_id={request_id})",
-            msg.path
+            "Handling OpenBuffer path={path} (request_id={request_id})",
+            path = msg.path
         );
 
         let path = PathBuf::from(&msg.path);
@@ -1349,7 +1355,7 @@ impl ServerModel {
     #[cfg(feature = "local_fs")]
     fn handle_buffer_edit(&mut self, msg: BufferEdit, ctx: &mut ModelContext<Self>) {
         let Some(file_id) = self.buffers.file_id_for_path(&msg.path) else {
-            log::warn!("BufferEdit for unknown buffer: {}", msg.path);
+            log::warn!("BufferEdit for unknown buffer: {path}", path = msg.path);
             return;
         };
 
@@ -1373,15 +1379,15 @@ impl ServerModel {
         ctx: &mut ModelContext<Self>,
     ) -> HandlerOutcome {
         log::info!(
-            "Handling SaveBuffer path={} (request_id={request_id})",
-            msg.path
+            "Handling SaveBuffer path={path} (request_id={request_id})",
+            path = msg.path
         );
 
         let Some(file_id) = self.buffers.file_id_for_path(&msg.path) else {
             return HandlerOutcome::Sync(server_message::Message::SaveBufferResponse(
                 SaveBufferResponse {
                     result: Some(save_buffer_response::Result::Error(FileOperationError {
-                        message: format!("Buffer not open: {}", msg.path),
+                        message: format!("Buffer not open: {path}", path = msg.path),
                     })),
                 },
             ));
@@ -1426,8 +1432,8 @@ impl ServerModel {
         ctx: &mut ModelContext<Self>,
     ) -> HandlerOutcome {
         log::info!(
-            "Handling ResolveConflict path={} (request_id={request_id})",
-            msg.path
+            "Handling ResolveConflict path={path} (request_id={request_id})",
+            path = msg.path
         );
 
         let Some(file_id) = self.buffers.file_id_for_path(&msg.path) else {
@@ -1435,7 +1441,7 @@ impl ServerModel {
                 ResolveConflictResponse {
                     result: Some(resolve_conflict_response::Result::Error(
                         FileOperationError {
-                            message: format!("Buffer not open: {}", msg.path),
+                            message: format!("Buffer not open: {path}", path = msg.path),
                         },
                     )),
                 },
@@ -1517,7 +1523,10 @@ impl ServerModel {
         conn_id: ConnectionId,
         ctx: &mut ModelContext<Self>,
     ) {
-        log::info!("Handling CloseBuffer path={} conn={conn_id}", msg.path);
+        log::info!(
+            "Handling CloseBuffer path={path} conn={conn_id}",
+            path = msg.path
+        );
         self.buffers.close_buffer(&msg.path, conn_id, ctx);
     }
 }

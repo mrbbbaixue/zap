@@ -450,6 +450,9 @@ impl CodeView {
                 editor =
                     editor.with_selection_as_context(Box::new(get_context_target_terminal_view));
             }
+
+            // 与本地 shared-buffer 编辑器一致:补上 footer / 保存冲突 UI。
+            editor.add_footer(ctx);
             editor
         })
     }
@@ -845,13 +848,15 @@ impl CodeView {
 
     /// Set the title of the pane, which is the file path.
     fn set_title(&self, _unsaved_changes: bool, ctx: &mut ViewContext<Self>) {
-        let file = self.local_path(ctx);
-        let is_new = self
-            .tab_at(self.active_tab_index)
-            .is_some_and(|t| t.editor_view.as_ref(ctx).is_new_file());
+        let active_tab = self.tab_at(self.active_tab_index);
+        let is_new = active_tab.is_some_and(|t| t.editor_view.as_ref(ctx).is_new_file());
 
-        let title = if let Some(file) = file {
+        // 标题优先用本地路径(完整路径),远端文件无本地路径时回退到
+        // `location` 派生的显示名,避免远端 tab 显示成 "Untitled"。
+        let title = if let Some(file) = self.local_path(ctx) {
             file.display().to_string()
+        } else if let Some(name) = active_tab.map(|t| t.display_name()) {
+            name
         } else {
             "Untitled".to_string()
         };
@@ -1155,11 +1160,8 @@ impl CodeView {
         ctx: &mut ViewContext<Self>,
     ) {
         if let Some(tab) = self.tab_at(index) {
-            let file_name = tab
-                .path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|name| name.to_string_lossy().to_string());
+            // 用 `location` 派生文件名:远端文件没有本地 `path`,否则会丢失文件名。
+            let file_name = tab.location().map(|loc| loc.display_name());
             let summary = UnsavedStateSummary::for_editor_tab(
                 file_name,
                 vec![CodeEditorStatus::new(Self::has_unsaved_changes(tab, ctx))],
@@ -2063,8 +2065,9 @@ impl CodeView {
 
                     to_extend.push(new_data);
                     // If the newly added tab is the active tab in the source CodeView, update the active tab index to point to it.
+                    // `existing_locations_to_idx` 漏算了无 location 的 tab,需用 tab_group 长度。
                     if i == source_code_view.active_tab_index() {
-                        active_tab_index = existing_locations_to_idx.len() + to_extend.len() - 1;
+                        active_tab_index = self.tab_group.len() + to_extend.len() - 1;
                     }
                 }
             }

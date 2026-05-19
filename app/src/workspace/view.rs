@@ -5314,9 +5314,9 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) {
         log::info!(
-            "Opening remote file: host={} path={}",
-            remote_path.host_id,
-            remote_path.path.as_str()
+            "Opening remote file: host={host} path={path}",
+            host = remote_path.host_id,
+            path = remote_path.path.as_str()
         );
 
         let layout = *EditorSettings::as_ref(ctx).open_file_layout.value();

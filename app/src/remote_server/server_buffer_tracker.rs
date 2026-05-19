@@ -107,6 +107,13 @@ impl ServerBufferTracker {
         conn_id: ConnectionId,
         ctx: &mut ModelContext<ServerModel>,
     ) -> Vec<FileId> {
+        // 丢弃该连接产生的所有 pending 请求,避免断连后留下陈旧条目。
+        for entries in self.pending_requests.values_mut() {
+            entries.retain(|(_, pending_conn_id, _)| *pending_conn_id != conn_id);
+        }
+        self.pending_requests
+            .retain(|_, entries| !entries.is_empty());
+
         let orphaned: Vec<FileId> = self
             .buffer_connections
             .iter_mut()
@@ -123,6 +130,7 @@ impl ServerBufferTracker {
         for &file_id in &orphaned {
             self.buffer_connections.remove(&file_id);
             self.open_buffers.retain(|_, id| *id != file_id);
+            self.pending_requests.remove(&file_id);
             // 释放强引用,允许 buffer 被回收。
             self.buffer_handles.remove(&file_id);
             GlobalBufferModel::handle(ctx).update(ctx, |gbm, ctx| gbm.remove(file_id, ctx));
@@ -153,6 +161,7 @@ impl ServerBufferTracker {
         // No connections remain — deallocate.
         self.buffer_connections.remove(&file_id);
         self.open_buffers.remove(path);
+        self.pending_requests.remove(&file_id);
         // 释放强引用,允许 buffer 被回收。
         self.buffer_handles.remove(&file_id);
         GlobalBufferModel::handle(ctx).update(ctx, |gbm, ctx| gbm.remove(file_id, ctx));

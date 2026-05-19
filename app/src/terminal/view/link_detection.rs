@@ -490,9 +490,11 @@ impl super::TerminalView {
         use crate::util::file::{LinkValidationContext, RemoteDirListing};
 
         let cwd_path = PathBuf::from(cwd);
+        // 缓存按 (会话, cwd) 复合键索引,避免不同 host 的相同路径互相串扰。
+        let cache_key = (session_id, cwd_path.clone());
 
         // 命中缓存(已就绪或拉取中)直接返回。
-        if let Some(entry) = self.remote_dir_listing_cache.get(&cwd_path) {
+        if let Some(entry) = self.remote_dir_listing_cache.get(&cache_key) {
             return LinkValidationContext::Remote(entry.clone());
         }
 
@@ -507,17 +509,19 @@ impl super::TerminalView {
 
         // 拉取新 cwd:清掉旧条目保持有界,插入 `None` 占位(标记拉取中)。
         self.remote_dir_listing_cache.clear();
-        self.remote_dir_listing_cache.insert(cwd_path.clone(), None);
+        self.remote_dir_listing_cache
+            .insert(cache_key.clone(), None);
 
         let cwd_for_request = cwd.to_string();
         let cwd_for_store = cwd_path.clone();
+        let key_for_store = cache_key.clone();
         ctx.spawn(
             async move { client.list_directory(cwd_for_request).await },
             move |me, result, ctx| {
                 use crate::remote_server::proto::list_directory_response;
 
                 // 拉取期间用户可能已经切换 cwd / 清空缓存,只有占位还在才写入。
-                if !me.remote_dir_listing_cache.contains_key(&cwd_for_store) {
+                if !me.remote_dir_listing_cache.contains_key(&key_for_store) {
                     return;
                 }
                 match result {
@@ -531,7 +535,7 @@ impl super::TerminalView {
                             let listing =
                                 Arc::new(RemoteDirListing::new(cwd_for_store.clone(), entries));
                             me.remote_dir_listing_cache
-                                .insert(cwd_for_store.clone(), Some(listing));
+                                .insert(key_for_store.clone(), Some(listing));
                             // 列表到达,触发 re-render 让链接重新扫描并点亮。
                             ctx.notify();
                         }
@@ -541,15 +545,15 @@ impl super::TerminalView {
                                 err.message
                             );
                             // 拉取失败:移除占位,下次悬停时会重试。
-                            me.remote_dir_listing_cache.remove(&cwd_for_store);
+                            me.remote_dir_listing_cache.remove(&key_for_store);
                         }
                         None => {
-                            me.remote_dir_listing_cache.remove(&cwd_for_store);
+                            me.remote_dir_listing_cache.remove(&key_for_store);
                         }
                     },
                     Err(err) => {
                         log::warn!("远端 ListDirectory RPC 出错 {cwd_for_store:?}: {err}");
-                        me.remote_dir_listing_cache.remove(&cwd_for_store);
+                        me.remote_dir_listing_cache.remove(&key_for_store);
                     }
                 }
             },
@@ -619,10 +623,11 @@ impl super::TerminalView {
             Some(path) if matches!(from_editor, TerminalEditor::No) => {
                 let possible_paths = self.model.lock().possible_file_paths_at_point(position);
                 let max_columns = self.size_info.columns;
-                let shell_launch_data = self
-                    .active_block_session_id()
-                    .and_then(|active_session_id| self.sessions.as_ref(ctx).get(active_session_id))
-                    .and_then(|active_session| active_session.launch_data().cloned());
+                // 用被悬停 block 自己的 launch data,避免跨会话/host/WSL 时
+                // 用错 shell 规则解析路径。
+                let shell_launch_data = block_session_id
+                    .and_then(|session_id| self.sessions.as_ref(ctx).get(session_id))
+                    .and_then(|session| session.launch_data().cloned());
 
                 // Using the thread builder instead of ctx.spawn here so that the previous
                 // scanning job will be dropped once there is a new scanning job created.

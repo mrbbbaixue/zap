@@ -1001,6 +1001,9 @@ impl GlobalBufferModel {
         }
 
         let file_id = FileId::new();
+        // TODO(ssh-remote): buffer 在初始内容(OpenBufferResponse)到达前即可编辑,
+        // 加载窗口内的用户编辑会被 replace_all() 覆盖丢失。需在 Buffer/编辑器层
+        // 增加 read-only 支持后,在 sync_clock=None 期间锁定该 buffer。
         let buffer = ctx.add_model(|_| Buffer::default());
 
         // Store state with sync_clock = None (set to Some on OpenBufferResponse).
@@ -1090,6 +1093,8 @@ impl GlobalBufferModel {
             let manager = remote_server::manager::RemoteServerManager::handle(ctx);
             let Some(client) = manager.as_ref(ctx).client_for_host(&host_id).cloned() else {
                 log::warn!("No remote server client for host {host_id:?}");
+                // 清理失败的 file_id,使后续重试能重新发送 OpenBuffer。
+                self.cleanup_file_id(file_id, ctx);
                 ctx.emit(GlobalBufferModelEvent::FailedToLoad {
                     file_id,
                     error: Rc::new(FileLoadError::DoesNotExist),
@@ -1127,6 +1132,8 @@ impl GlobalBufferModel {
                     }
                     Err(error) => {
                         log::warn!("Failed to open remote buffer: {error}");
+                        // 清理失败的 file_id,使后续重试能重新发送 OpenBuffer。
+                        me.cleanup_file_id(file_id, ctx);
                         ctx.emit(GlobalBufferModelEvent::FailedToLoad {
                             file_id,
                             error: Rc::new(FileLoadError::DoesNotExist),
@@ -1302,7 +1309,8 @@ impl GlobalBufferModel {
             return Err(FileSaveError::RemoteError("Buffer deallocated".to_string()));
         };
         let content = buffer.as_ref(ctx).text().into_string();
-        let version = ContentVersion::new();
+        // 使用 buffer 当前版本,避免与 daemon 的版本同步错位。
+        let version = buffer.as_ref(ctx).version();
         FileModel::handle(ctx).update(ctx, |file_model, ctx| {
             file_model.save(file_id, content, version, ctx)
         })
@@ -1324,8 +1332,19 @@ impl GlobalBufferModel {
         };
 
         if let BufferSource::ServerLocal { sync_clock, .. } = &mut state.source {
+            // 拒绝过期的冲突解决:若服务端版本在客户端看到冲突后又变化,
+            // 强行覆盖会丢掉更新的服务端编辑。
+            if sync_clock.server_version != acknowledged_server_version {
+                return Err(FileSaveError::RemoteError(
+                    "Stale conflict resolution".to_string(),
+                ));
+            }
             sync_clock.server_version = acknowledged_server_version;
             sync_clock.client_version = current_client_version;
+        } else {
+            return Err(FileSaveError::RemoteError(
+                "Buffer is not server-local".to_string(),
+            ));
         }
 
         let Some(buffer) = state.buffer.upgrade(ctx) else {
@@ -1340,9 +1359,10 @@ impl GlobalBufferModel {
 
         // Save to disk. Note: the buffer content has already been replaced
         // in memory above. If the save fails, memory and disk will diverge.
+        // 使用 buffer 当前版本,且在保存成功(FileSaved 回调)前不更新
+        // base_content_version,避免与 daemon 版本同步错位。
         let content = client_content.to_string();
-        let save_version = ContentVersion::new();
-        state.set_base_content_version(save_version);
+        let save_version = buffer.as_ref(ctx).version();
         FileModel::handle(ctx).update(ctx, |file_model, ctx| {
             file_model.save(file_id, content, save_version, ctx)
         })
@@ -1404,6 +1424,13 @@ impl GlobalBufferModel {
         let manager = remote_server::manager::RemoteServerManager::handle(ctx);
         let Some(client) = manager.as_ref(ctx).client_for_host(&host_id).cloned() else {
             log::warn!("save_remote_buffer: host {host_id:?} 无 remote server client");
+            // 通知编辑器保存失败,避免停留在虚假的“已保存”状态。
+            ctx.emit(GlobalBufferModelEvent::FailedToSave {
+                file_id,
+                error: Rc::new(FileSaveError::RemoteError(format!(
+                    "Remote host {host_id:?} is not connected"
+                ))),
+            });
             return;
         };
 
@@ -1422,12 +1449,22 @@ impl GlobalBufferModel {
                             ctx.emit(GlobalBufferModelEvent::FileSaved { file_id });
                         }
                         Some(SaveResult::Error(err)) => {
-                            log::warn!("远端保存失败: {}", err.message);
+                            // 把远端保存失败上抛给编辑器,显示失败提示。
+                            ctx.emit(GlobalBufferModelEvent::FailedToSave {
+                                file_id,
+                                error: Rc::new(FileSaveError::RemoteError(err.message)),
+                            });
                         }
                     }
                 }
                 Err(error) => {
-                    log::warn!("save_remote_buffer: SaveBuffer 请求失败: {error}");
+                    // 传输/协议错误同样上抛给编辑器。
+                    ctx.emit(GlobalBufferModelEvent::FailedToSave {
+                        file_id,
+                        error: Rc::new(FileSaveError::RemoteError(format!(
+                            "SaveBuffer request failed: {error}"
+                        ))),
+                    });
                 }
             },
         );
