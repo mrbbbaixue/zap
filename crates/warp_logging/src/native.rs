@@ -369,17 +369,13 @@ fn write_log_bundle_zip_inner(zip_path: &Path, extras: &LogBundleExtras) -> Resu
         let source_display = extra.source_path.display();
         let Some(safe_entry) = sanitize_zip_entry_name(&extra.entry_name) else {
             let raw = &extra.entry_name;
-            log::warn!(
-                "Skipping extra log file {source_display}: invalid zip entry name {raw:?}"
-            );
+            log::warn!("Skipping extra log file {source_display}: invalid zip entry name {raw:?}");
             continue;
         };
         match File::open(&extra.source_path) {
             Ok(mut source) => {
                 if let Err(err) = zip_writer.start_file(&safe_entry, zip_options) {
-                    log::warn!(
-                        "Skipping extra log file {source_display} in bundle: {err}"
-                    );
+                    log::warn!("Skipping extra log file {source_display} in bundle: {err}");
                     continue;
                 }
                 if let Err(err) = copy(&mut source, &mut zip_writer) {
@@ -389,9 +385,7 @@ fn write_log_bundle_zip_inner(zip_path: &Path, extras: &LogBundleExtras) -> Resu
                 }
             }
             Err(err) => {
-                log::warn!(
-                    "Failed to open extra log file {source_display} for bundle: {err}"
-                );
+                log::warn!("Failed to open extra log file {source_display} for bundle: {err}");
             }
         }
     }

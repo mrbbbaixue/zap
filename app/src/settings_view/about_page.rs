@@ -234,11 +234,7 @@ impl SettingsWidget for AboutPageWidget {
                 )
                 .finish();
 
-            content.add_child(
-                Container::new(export_section)
-                    .with_margin_top(16.)
-                    .finish(),
-            );
+            content.add_child(Container::new(export_section).with_margin_top(16.).finish());
         }
 
         if AppExecutionMode::as_ref(app).can_autoupdate() {

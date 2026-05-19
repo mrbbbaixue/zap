@@ -56,6 +56,8 @@ use crate::ai::predict::prompt_suggestions::{
     is_accept_prompt_suggestion_bound_to_ctrl_enter,
 };
 use crate::search::slash_command_menu::static_commands::commands;
+use crate::ssh_manager::onekey::load_saved_ssh_credentials;
+use crate::ssh_manager::password_prompt::bytes_look_like_password_prompt;
 use crate::terminal::input::inline_menu::InlineMenuPositioner;
 use crate::terminal::view::passive_suggestions::PromptSuggestionResolution;
 pub use crate::terminal::view::rich_content::{
@@ -315,6 +317,7 @@ use crate::terminal::shared_session::protocol::{
     ParticipantId, Role, WindowSize as SessionSharingWindowSize,
 };
 use async_channel::{Receiver, Sender};
+use async_stream::stream;
 use chrono::{DateTime, Local, NaiveDateTime};
 use command_corrections::rules::{Rule, RuleId as CommandCorrectionsRuleId};
 use command_corrections::{correct_command, Command, Correction, HistoryItem, SessionMetadata};
@@ -648,6 +651,10 @@ const P10K_UPDATE_INSTRUCTIONS_URL: &str =
     "https://github.com/romkatv/powerlevel10k#how-do-i-update-powerlevel10k";
 
 const CONTEXT_MENU_WIDTH: f32 = 280.;
+const ONEKEY_CONTEXT_MENU_WIDTH: f32 = 320.;
+const ONEKEY_PROMPT_THROTTLE: Duration = Duration::from_secs(2);
+const ONEKEY_PROMPT_SLIDING_WINDOW_BYTES: usize = 8 * 1024;
+const ONEKEY_PROMPT_BUFFER_HARD_LIMIT: usize = 16 * 1024;
 
 /// The minimum amount of mouse-drag to consider a selection to
 /// be a text-selection as opposed to mouse-drag noise.
@@ -1885,6 +1892,8 @@ pub enum ContextMenuType {
     Prompt { position: Vector2F },
     /// Opened via right-clicking on the input box.
     Input { position: Vector2F },
+    /// 检测到 PTY 输出密码提示后自动打开。
+    OneKeyPrompt,
 
     /// Lists the block(s) or text attached as context to the query represented in the AI block
     /// whose view id is the given [`EntityId`]. The menu is opened by clicking on the attached
@@ -1922,6 +1931,7 @@ impl ContextMenuType {
             ContextMenuType::AltScreen { position } => Some(*position),
             ContextMenuType::Prompt { position } => Some(*position),
             ContextMenuType::Input { position } => Some(*position),
+            ContextMenuType::OneKeyPrompt => None,
             ContextMenuType::AIBlockAttachedContext { .. } => None,
             ContextMenuType::AIBlockOverflowMenu { .. } => None,
         }
@@ -1940,6 +1950,7 @@ impl ContextMenuInfo {
             ContextMenuType::BlockList { .. } => "Block",
             ContextMenuType::Prompt { .. } => "Prompt",
             ContextMenuType::Input { .. } => "Input",
+            ContextMenuType::OneKeyPrompt => "OneKeyPrompt",
             ContextMenuType::AltScreen { .. } => "AltScreen",
             ContextMenuType::AIBlockAttachedContext { .. } => "AIBlockContextList",
             ContextMenuType::AIBlockOverflowMenu { .. } => "AIBlockOverflowMenu",
@@ -1960,6 +1971,7 @@ impl ContextMenuInfo {
             },
             ContextMenuType::Prompt { .. } => "RightClick",
             ContextMenuType::Input { .. } => "RightClick",
+            ContextMenuType::OneKeyPrompt => "PasswordPrompt",
             ContextMenuType::AltScreen { .. } => "AltScreen",
             ContextMenuType::AIBlockAttachedContext { .. } => "AIBlockAttachedBlockChipLeftClick",
             ContextMenuType::AIBlockOverflowMenu { .. } => "AIBlockOverflowMenuClick",
@@ -2236,6 +2248,12 @@ impl DropTargetData for TerminalDropTargetData {
     }
 }
 
+struct OneKeyPromptCandidate {
+    label: String,
+    subtitle: String,
+    secret: zeroize::Zeroizing<String>,
+}
+
 pub struct TerminalView {
     pub model: Arc<FairMutex<TerminalModel>>,
     view_handle: WeakViewHandle<Self>,
@@ -2279,6 +2297,8 @@ pub struct TerminalView {
 
     /// None iff there is no context menu open currently.
     context_menu_state: Option<ContextMenuState>,
+    onekey_prompt_candidates: Vec<OneKeyPromptCandidate>,
+    onekey_last_prompt_at: Option<Instant>,
 
     /// The search bar at the top of the terminal view.
     find_bar: ViewHandle<Find<TerminalFindModel>>,
@@ -3658,6 +3678,11 @@ impl TerminalView {
             });
         }
 
+        let onekey_pty_reads_rx = inactive_pty_reads_rx.clone();
+        if FeatureFlag::OneKeyPrompt.is_enabled() {
+            Self::spawn_onekey_prompt_listener(onekey_pty_reads_rx, ctx);
+        }
+
         // Here we initialize the block list mouse states for block zero.
         // Afterwards, we initialize all block list mouse states for a block when the
         // previous block sends a `BlockCompleted` event.
@@ -3747,6 +3772,8 @@ impl TerminalView {
             horizontal_clipped_scroll_state: Default::default(),
             is_selecting: false,
             context_menu_state: None,
+            onekey_prompt_candidates: Vec::new(),
+            onekey_last_prompt_at: None,
             context_menu,
             hovered_secret: None,
             open_secret_tool_tip: None,
@@ -7115,6 +7142,39 @@ impl TerminalView {
     ) -> Option<async_broadcast::InactiveReceiver<std::sync::Arc<Vec<u8>>>> {
         self.pty_recorder
             .read(ctx, |recorder, _| recorder.inactive_pty_reads_rx())
+    }
+
+    fn spawn_onekey_prompt_listener(
+        pty_reads_rx: Option<async_broadcast::InactiveReceiver<Arc<Vec<u8>>>>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(rx) = pty_reads_rx else {
+            return;
+        };
+
+        let prompt_stream = stream! {
+            let mut active = rx.activate_cloned();
+            let mut buf: Vec<u8> = Vec::with_capacity(ONEKEY_PROMPT_SLIDING_WINDOW_BYTES);
+            while let Ok(chunk) = active.recv().await {
+                buf.extend_from_slice(&chunk);
+                if buf.len() > ONEKEY_PROMPT_BUFFER_HARD_LIMIT {
+                    let drop_n = buf.len() - ONEKEY_PROMPT_SLIDING_WINDOW_BYTES;
+                    buf.drain(..drop_n);
+                }
+                if bytes_look_like_password_prompt(&buf) {
+                    buf.clear();
+                    yield ();
+                }
+            }
+        };
+
+        let _ = ctx.spawn_stream_local(
+            prompt_stream,
+            |view, (), ctx| {
+                view.show_onekey_prompt_menu(ctx);
+            },
+            |_, _| {},
+        );
     }
 
     fn write_agent_bytes_to_pty<B: Into<Cow<'static, [u8]>>>(
@@ -15147,7 +15207,16 @@ impl TerminalView {
     ) {
         ctx.update_view(&self.context_menu, |context_menu, view_ctx| {
             context_menu.set_origin(menu_state.menu_type.origin());
-            context_menu.set_width(CONTEXT_MENU_WIDTH);
+            let width = match menu_state.menu_type {
+                ContextMenuType::OneKeyPrompt => ONEKEY_CONTEXT_MENU_WIDTH,
+                ContextMenuType::BlockList { .. }
+                | ContextMenuType::AltScreen { .. }
+                | ContextMenuType::Prompt { .. }
+                | ContextMenuType::Input { .. }
+                | ContextMenuType::AIBlockAttachedContext { .. }
+                | ContextMenuType::AIBlockOverflowMenu { .. } => CONTEXT_MENU_WIDTH,
+            };
+            context_menu.set_width(width);
             // This will also reset the selection.
             context_menu.set_items(items, view_ctx);
         });
@@ -15172,6 +15241,83 @@ impl TerminalView {
             );
             ctx.notify();
         });
+    }
+
+    fn show_onekey_prompt_menu(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.context_menu_state.is_some()
+            || self
+                .onekey_last_prompt_at
+                .is_some_and(|instant| instant.elapsed() < ONEKEY_PROMPT_THROTTLE)
+        {
+            return;
+        }
+
+        let credentials = match load_saved_ssh_credentials() {
+            Ok(credentials) => credentials,
+            Err(e) => {
+                log::warn!("onekey: failed to load saved ssh credentials: {e:?}");
+                return;
+            }
+        };
+        if credentials.is_empty() {
+            return;
+        }
+
+        self.onekey_prompt_candidates = credentials
+            .into_iter()
+            .map(|credential| OneKeyPromptCandidate {
+                label: credential.label,
+                subtitle: credential.subtitle,
+                secret: credential.secret,
+            })
+            .collect();
+
+        let items = self
+            .onekey_prompt_candidates
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                MenuItemFields::new_with_stacked_label(
+                    candidate.label.clone(),
+                    candidate.subtitle.clone(),
+                )
+                .with_icon(icons::Icon::Key)
+                .with_on_select_action(TerminalAction::OneKeyFillSecret { index })
+                .into_item()
+            })
+            .collect();
+        self.onekey_last_prompt_at = Some(Instant::now());
+        self.show_context_menu(
+            ContextMenuState {
+                menu_type: ContextMenuType::OneKeyPrompt,
+            },
+            items,
+            ctx,
+        );
+        ctx.update_view(&self.context_menu, |context_menu, ctx| {
+            context_menu.select_next(ctx);
+        });
+    }
+
+    fn fill_onekey_secret(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
+        let Some(candidate) = self.onekey_prompt_candidates.get(index) else {
+            self.close_context_menu(ctx, true);
+            return;
+        };
+        let mut bytes = candidate.secret.as_bytes().to_vec();
+        bytes.push(b'\n');
+        self.write_to_pty(bytes, ctx);
+        self.close_context_menu(ctx, true);
+    }
+
+    pub(crate) fn note_ssh_secret_auto_injected(&mut self, ctx: &mut ViewContext<Self>) {
+        self.onekey_last_prompt_at = Some(Instant::now());
+        if matches!(
+            self.context_menu_state.map(|state| state.menu_type),
+            Some(ContextMenuType::OneKeyPrompt)
+        ) {
+            self.close_context_menu(ctx, true);
+        }
     }
 
     fn alt_mouse_action(&mut self, mouse_state: &MouseState, ctx: &mut ViewContext<Self>) {
@@ -17924,8 +18070,10 @@ impl TerminalView {
     }
 
     fn close_context_menu(&mut self, ctx: &mut ViewContext<Self>, should_redetermine_focus: bool) {
-        if self.context_menu_state.is_some() {
-            self.context_menu_state = None;
+        if let Some(state) = self.context_menu_state.take() {
+            if matches!(state.menu_type, ContextMenuType::OneKeyPrompt) {
+                self.onekey_prompt_candidates.clear();
+            }
             ctx.notify();
             if should_redetermine_focus {
                 self.redetermine_global_focus(ctx);
@@ -22639,6 +22787,7 @@ impl TypedActionView for TerminalView {
             InsertCommandCorrection { .. }
             | BlockListContextMenu(_)
             | CloseContextMenu
+            | OneKeyFillSecret { .. }
             | Paste
             | MiddleClickOnGrid { .. }
             | MiddleClickOnInput
@@ -22929,6 +23078,7 @@ impl TypedActionView for TerminalView {
                 }
             }
             CloseContextMenu => self.close_context_menu(ctx, true),
+            OneKeyFillSecret { index } => self.fill_onekey_secret(*index, ctx),
             Paste => self.paste(false, ctx),
             Copy => self.copy(ctx),
             CopyOutputs => self.copy_outputs(ctx),
@@ -23966,6 +24116,27 @@ impl View for TerminalView {
                             ChildAnchor::TopLeft,
                         )
                     }
+                },
+            ),
+            Some(ContextMenuType::OneKeyPrompt) => stack.add_positioned_overlay_child(
+                ChildView::new(&self.context_menu).finish(),
+                match input_mode {
+                    InputMode::PinnedToBottom | InputMode::Waterfall => {
+                        OffsetPositioning::offset_from_save_position_element(
+                            self.input.as_ref(app).save_position_id(),
+                            vec2f(0., -8.),
+                            PositionedElementOffsetBounds::WindowByPosition,
+                            PositionedElementAnchor::TopLeft,
+                            ChildAnchor::BottomLeft,
+                        )
+                    }
+                    InputMode::PinnedToTop => OffsetPositioning::offset_from_save_position_element(
+                        self.input.as_ref(app).save_position_id(),
+                        vec2f(0., 8.),
+                        PositionedElementOffsetBounds::WindowByPosition,
+                        PositionedElementAnchor::BottomLeft,
+                        ChildAnchor::TopLeft,
+                    ),
                 },
             ),
             Some(ContextMenuType::AIBlockAttachedContext { ai_block_view_id }) => stack

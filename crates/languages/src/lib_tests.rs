@@ -98,6 +98,10 @@ fn new_language_aliases_normalize() {
     ] {
         let language = language_by_name(alias)
             .unwrap_or_else(|| panic!("expected alias `{alias}` to resolve to a language"));
-        assert_eq!(language.display_name(), expected, "`{alias}` should resolve");
+        assert_eq!(
+            language.display_name(),
+            expected,
+            "`{alias}` should resolve"
+        );
     }
 }

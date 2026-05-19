@@ -2299,6 +2299,8 @@ pub fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::AIRules,
         #[cfg(feature = "ssh_tmux_wrapper")]
         FeatureFlag::SSHTmuxWrapper,
+        #[cfg(feature = "onekey_prompt")]
+        FeatureFlag::OneKeyPrompt,
         #[cfg(feature = "less_horizontal_terminal_padding")]
         FeatureFlag::LessHorizontalTerminalPadding,
         #[cfg(feature = "shell_selector")]
