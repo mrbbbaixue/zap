@@ -4,5 +4,6 @@ The user has configured the following global rules in OpenWarp (Settings → Age
 {% for rule in user_rules %}
 {% if rule.name %}## {{ rule.name }}
 {% endif %}{{ rule.content }}
-{% endfor %}
+{% if not loop.last %}
+{% endif %}{% endfor %}
 {% endif %}

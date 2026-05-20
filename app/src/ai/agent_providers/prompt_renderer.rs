@@ -706,6 +706,42 @@ mod tests {
     }
 
     #[test]
+    fn render_user_rules_separates_multiple_rules_with_blank_line() {
+        // 多条规则之间应有空行分隔(`{% if not loop.last %}`),最后一条之后不留空行。
+        let rules = vec![
+            (Some("R1".to_string()), "first content".to_string()),
+            (Some("R2".to_string()), "second content".to_string()),
+            (Some("R3".to_string()), "third content".to_string()),
+        ];
+        let out = render_system(
+            &LLMId::from("byop:p:deepseek-chat"),
+            &[],
+            &[],
+            false,
+            &rules,
+        );
+
+        // 两条规则之间应至少包含一个 "blank line"(两个相邻换行)。
+        // 不写死具体换行数,因为 minijinja 的 trim_blocks/lstrip_blocks 默认行为
+        // 决定的具体换行数容易随模板微调而变(reviewer 实测出过 3 个换行的形态)。
+        // 我们要的契约是"有视觉空行 + 顺序正确"。
+        let pos_r1 = out.find("first content").expect("找不到 R1 content");
+        let pos_r2 = out.find("## R2").expect("找不到 R2 标题");
+        let pos_r3 = out.find("## R3").expect("找不到 R3 标题");
+        assert!(pos_r1 < pos_r2 && pos_r2 < pos_r3, "顺序应保持: {out}");
+        let between_r1_r2 = &out[pos_r1 + "first content".len()..pos_r2];
+        let between_r2_r3 = &out[pos_r2..pos_r3];
+        assert!(
+            between_r1_r2.contains("\n\n"),
+            "R1 与 R2 之间应有空行,实际:{between_r1_r2:?}"
+        );
+        assert!(
+            between_r2_r3.contains("\n\n"),
+            "R2 与 R3 之间应有空行,实际:{between_r2_r3:?}"
+        );
+    }
+
+    #[test]
     fn render_user_rules_handles_no_name() {
         let rules = vec![(None, "Be terse.".to_string())];
         let out = render_system(

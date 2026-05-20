@@ -141,6 +141,29 @@ pub struct RequestParams {
     pub byop_target_task_id: Option<String>,
 }
 
+/// 收集用户在 设置 → Agents → Rules 创建的全局 Rules(`AIFact::Memory`)快照,
+/// 用于注入 BYOP system prompt(Issue #116)。
+///
+/// - 过滤 trashed 条目
+/// - 按 `(name, content)` 字典序排序,避免 HashMap 迭代导致的请求间顺序漂移
+///   (否则会击穿上游 Anthropic / OpenAI 的 prompt cache)
+///
+/// 不在内部判断 `is_memory_enabled`,gate 由调用方控制;这样函数可作为纯
+/// 集合逻辑独立测试,不依赖 `AISettings` 等 singleton。
+pub(crate) fn collect_user_rules(
+    object_store_model: &ObjectStoreModel,
+) -> Vec<(Option<String>, String)> {
+    let mut rules: Vec<(Option<String>, String)> = object_store_model
+        .get_all_objects_of_type::<GenericStringObjectId, AIFactObjectModel>()
+        .filter(|ai_fact| !ai_fact.is_trashed(object_store_model))
+        .map(|ai_fact| match &ai_fact.model().string_model {
+            AIFact::Memory(memory) => (memory.name.clone(), memory.content.clone()),
+        })
+        .collect();
+    rules.sort();
+    rules
+}
+
 pub type Event = Result<warp_multi_agent_api::ResponseEvent, Arc<AIApiError>>;
 
 #[cfg(not(target_family = "wasm"))]
@@ -222,24 +245,11 @@ impl RequestParams {
         let is_memory_enabled = ai_settings.is_memory_enabled(app);
         let warp_drive_context_enabled = ai_settings.is_warp_drive_context_enabled(app);
 
-        // OpenWarp BYOP 修复 Issue #116:用户在 设置 → Agents → Rules 创建的全局
-        // Rules(AIFact::Memory)从未被注入到 system prompt。这里从 ObjectStoreModel
-        // 一次性拉一份快照,后续由 `chat_stream::build_chat_request` → `render_system`
-        // 经 `partials/user_rules.j2` 渲染进 system 区,语义对齐官方 Warp。
-        //
-        // 过滤已 trash 条目;按 (name, content) 字典序排序,避免 HashMap 迭代
-        // 导致的请求间顺序漂移(否则会击穿上游 Anthropic / OpenAI 的 prompt cache)。
-        let user_rules: Vec<(Option<String>, String)> = if is_memory_enabled {
-            let object_store_model = ObjectStoreModel::as_ref(app);
-            let mut rules: Vec<(Option<String>, String)> = object_store_model
-                .get_all_objects_of_type::<GenericStringObjectId, AIFactObjectModel>()
-                .filter(|ai_fact| !ai_fact.is_trashed(object_store_model))
-                .map(|ai_fact| match &ai_fact.model().string_model {
-                    AIFact::Memory(memory) => (memory.name.clone(), memory.content.clone()),
-                })
-                .collect();
-            rules.sort();
-            rules
+        // OpenWarp BYOP 修复 Issue #116:gate 在 `is_memory_enabled`,具体收集逻辑
+        // 抽到 `collect_user_rules` 纯函数,只接 `&ObjectStoreModel` 入参以便测试,
+        // 不依赖完整 AppContext singleton 集合。
+        let user_rules = if is_memory_enabled {
+            collect_user_rules(ObjectStoreModel::as_ref(app))
         } else {
             Vec::new()
         };
@@ -426,3 +436,7 @@ impl RequestParams {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "api_tests.rs"]
+mod tests;
