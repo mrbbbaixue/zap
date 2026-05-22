@@ -270,14 +270,14 @@ header.nav {
 .lang-trigger {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    padding: 6px 10px;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
     background: transparent;
     border: 1px solid var(--line);
     border-radius: 6px;
     color: var(--ink-2);
-    font: inherit;
-    font-size: 13px;
     cursor: pointer;
     transition:
         border-color 0.15s ease,
@@ -294,16 +294,22 @@ header.nav {
 .lang-trigger:focus-visible {
     outline: 0;
 }
-.lang-current {
-    flex: 1;
+.lang-ico {
+    width: 16px;
+    height: 16px;
+    display: block;
 }
-.lang-chev {
-    width: 8px;
-    height: 8px;
-    border-right: 1.5px solid currentColor;
-    border-bottom: 1.5px solid currentColor;
-    transform: translateY(-2px) rotate(45deg);
-    opacity: 0.7;
+/* 仅供屏幕阅读器使用 */
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
 }
 .lang-menu {
     position: absolute;

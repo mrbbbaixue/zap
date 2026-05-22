@@ -564,17 +564,40 @@ git clone https://github.com/zerx-lab/zap.git zap
     const stage = document.querySelector('.hero-art .term-stage') as HTMLElement | null;
     if (!stage) return;
 
-    // 初始动画行(页面刚加载时)
-    const initLines = [
-      `<span class="p">$</span> npm run build`,
-      `<span class="dim">› vite v5.4 · production</span>`,
-      `<span class="dim">› 248 modules transformed</span>`,
-      `<span class="ok">✓ built in 1.24s</span>`,
-    ];
-    stage.innerHTML = initLines.map((l) => `<div class="typing-line">${l}</div>`).join('');
+    // 初始动画行(页面刚加载时) — 按当前 locale 渲染
+    // 命令本身保留英文(真实 shell 也是英文),只本地化人类语言部分
+    const initLinesByLocale: Record<'en' | 'zh' | 'ja', string[]> = {
+      en: [
+        `<span class="p">$</span> npm run build`,
+        `<span class="dim">› vite v5.4 · production</span>`,
+        `<span class="dim">› 248 modules transformed</span>`,
+        `<span class="ok">✓ built in 1.24s</span>`,
+      ],
+      zh: [
+        `<span class="p">$</span> npm run build`,
+        `<span class="dim">› vite v5.4 · 生产构建</span>`,
+        `<span class="dim">› 已转换 248 个模块</span>`,
+        `<span class="ok">✓ 1.24s 内构建完成</span>`,
+      ],
+      ja: [
+        `<span class="p">$</span> npm run build`,
+        `<span class="dim">› vite v5.4 · 本番ビルド</span>`,
+        `<span class="dim">› 248 モジュールを変換</span>`,
+        `<span class="ok">✓ 1.24 秒でビルド完了</span>`,
+      ],
+    };
+    function renderInitLines() {
+      stage.innerHTML = initLinesByLocale[locale()]
+        .map((l) => `<div class="typing-line">${l}</div>`)
+        .join('');
+    }
 
     const inputs = Array.from(document.querySelectorAll<HTMLInputElement>('.ti-fakeshell input'));
-    if (!inputs.length) return;
+    if (!inputs.length) {
+      // 即便没有输入框,也至少把初始动画行渲染出来
+      renderInitLines();
+      return;
+    }
     const history: string[] = [];
     let histIdx = -1;
 
@@ -583,6 +606,10 @@ git clone https://github.com/zerx-lab/zap.git zap
       if (l === 'zh' || l === 'ja') return l;
       return 'en';
     }
+
+    // 首次渲染初始动画行
+    renderInitLines();
+
     function pickInput(): HTMLInputElement | null {
       const lc = locale();
       return inputs.find((el) => el.dataset.lang === lc) || inputs[0] || null;
@@ -667,10 +694,10 @@ git clone https://github.com/zerx-lab/zap.git zap
         ],
         ja: [
           '<span class="k">プロトコル</span>         <span class="k">名前</span>          <span class="k">状態</span>',
-          'openai            anthropic     <span class="s">ready</span>',
-          'anthropic         claude-4-7    <span class="s">ready</span>',
-          'deepseek          deepseek-v4   <span class="s">ready</span>',
-          'ollama            local         <span class="s">ready</span>',
+          'openai            anthropic     <span class="s">準備完了</span>',
+          'anthropic         claude-4-7    <span class="s">準備完了</span>',
+          'deepseek          deepseek-v4   <span class="s">準備完了</span>',
+          'ollama            local         <span class="s">準備完了</span>',
         ],
       },
     };
@@ -681,7 +708,7 @@ git clone https://github.com/zerx-lab/zap.git zap
       if (lc === 'zh') {
         return [
           `<span class="k">[agent]</span> <span class="dim">路由至</span> anthropic/claude-4-7`,
-          `<span class="k">[agent]</span> <span class="dim">prompt</span>: ${escape(cleaned)}`,
+          `<span class="k">[agent]</span> <span class="dim">提示</span>: ${escape(cleaned)}`,
           `<span class="dim">思考中...</span>`,
           `<span class="s">→</span> 这是一个仿真响应。实际使用时会在本地调用你配置的服务商。`,
           `<span class="dim">凭证、会话、上下文全部在本地。</span>`,
@@ -690,7 +717,7 @@ git clone https://github.com/zerx-lab/zap.git zap
       if (lc === 'ja') {
         return [
           `<span class="k">[agent]</span> <span class="dim">ルーティング:</span> anthropic/claude-4-7`,
-          `<span class="k">[agent]</span> <span class="dim">prompt</span>: ${escape(cleaned)}`,
+          `<span class="k">[agent]</span> <span class="dim">プロンプト</span>: ${escape(cleaned)}`,
           `<span class="dim">考え中...</span>`,
           `<span class="s">→</span> これはシミュレーションです。実際にはローカルで設定済みプロバイダーを呼び出します。`,
           `<span class="dim">認証、会話、コンテキストはすべてローカルに残ります。</span>`,
@@ -733,7 +760,16 @@ git clone https://github.com/zerx-lab/zap.git zap
         const next = cur === 'dark' ? 'light' : 'dark';
         document.documentElement.setAttribute('data-theme', next);
         try { localStorage.setItem('zap:theme', next); } catch (_) {}
-        const msg = lc === 'zh' ? `已切换至 ${next} 主题` : lc === 'ja' ? `テーマを ${next} に切り替えました` : `Theme switched to ${next}`;
+        const themeName = lc === 'zh'
+          ? (next === 'dark' ? '深色' : '浅色')
+          : lc === 'ja'
+          ? (next === 'dark' ? 'ダーク' : 'ライト')
+          : next;
+        const msg = lc === 'zh'
+          ? `已切换至${themeName}主题`
+          : lc === 'ja'
+          ? `テーマを${themeName}に切り替えました`
+          : `Theme switched to ${themeName}`;
         printRaw(msg, 'ok');
         return;
       }
@@ -822,5 +858,16 @@ git clone https://github.com/zerx-lab/zap.git zap
       const cur = document.body.dataset.locale || 'en';
       opt.classList.toggle('active', v === cur);
     });
+
+    // 监听全站 locale 变化 (无论是导航栏、mock dropdown 还是其他入口触发)
+    // 切换后清空仿真终端并重新打印初始动画行，让 demo 会“跟随语言”
+    let lastLocale = locale();
+    const localeObserver = new MutationObserver(() => {
+      const cur = locale();
+      if (cur === lastLocale) return;
+      lastLocale = cur;
+      renderInitLines();
+    });
+    localeObserver.observe(document.body, { attributes: true, attributeFilter: ['data-locale'] });
   })();
 </script>
