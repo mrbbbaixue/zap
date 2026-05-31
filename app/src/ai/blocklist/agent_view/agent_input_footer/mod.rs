@@ -64,8 +64,6 @@ use std::sync::Arc;
 use crate::terminal::local_shell::LocalShellState;
 #[cfg(not(target_family = "wasm"))]
 use crate::terminal::ShellLaunchData;
-#[cfg(feature = "voice_input")]
-use crate::voice::transcriber::TranscribeError;
 use ai::document::{AIDocumentId, AIDocumentVersion};
 use parking_lot::FairMutex;
 use pathfinder_color::ColorU;
@@ -81,7 +79,7 @@ use std::time::Duration;
 #[cfg(not(target_family = "wasm"))]
 use tokio::fs;
 #[cfg(feature = "voice_input")]
-use voice_input::{StartListeningError, VoiceSessionResult};
+use voice_input::{StartListeningError, VoiceSessionError};
 
 use warp_core::{
     report_if_error,
@@ -90,8 +88,6 @@ use warp_core::{
         theme::{color::internal_colors, Fill},
     },
 };
-#[cfg(feature = "voice_input")]
-use warpui::r#async::SpawnedFutureHandle;
 use warpui::{
     elements::{
         Border, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container, CornerRadius,
@@ -134,8 +130,9 @@ use crate::workspace::WorkspaceAction;
 enum CLIVoiceInputState {
     #[default]
     Stopped,
-    Listening,
-    Transcribing,
+    Listening {
+        enabled_from: voice_input::VoiceInputToggledFrom,
+    },
 }
 
 /// How long to wait after session creation before showing the install chip.
@@ -222,8 +219,6 @@ pub struct AgentInputFooter {
     // CLI agent voice input state (self-contained, bypasses editor voice flow).
     #[cfg(feature = "voice_input")]
     cli_voice_input_state: CLIVoiceInputState,
-    #[cfg(feature = "voice_input")]
-    cli_transcription_handle: Option<SpawnedFutureHandle>,
     v2_model_selector: Option<ViewHandle<ModelSelector>>,
 }
 
@@ -707,8 +702,6 @@ impl AgentInputFooter {
             fast_forward_button,
             #[cfg(feature = "voice_input")]
             cli_voice_input_state: CLIVoiceInputState::default(),
-            #[cfg(feature = "voice_input")]
-            cli_transcription_handle: None,
             ftu_callout_close_button: ctx.add_typed_action_view(|_ctx| {
                 ActionButton::new("", NakedTheme)
                     .with_icon(Icon::X)
@@ -1426,24 +1419,16 @@ impl AgentInputFooter {
             return;
         }
 
-        if matches!(self.cli_voice_input_state, CLIVoiceInputState::Listening) {
+        if matches!(
+            self.cli_voice_input_state,
+            CLIVoiceInputState::Listening { .. }
+        ) {
             voice_input::VoiceInput::handle(ctx).update(ctx, |voice_input, _| {
                 voice_input.abort_listening();
             });
         }
 
-        if matches!(self.cli_voice_input_state, CLIVoiceInputState::Transcribing) {
-            if let Some(handle) = self.cli_transcription_handle.take() {
-                handle.abort();
-            }
-
-            voice_input::VoiceInput::handle(ctx).update(ctx, |voice, _| {
-                voice.set_transcribing_active(false);
-            });
-        }
-
         self.cli_voice_input_state = CLIVoiceInputState::Stopped;
-        self.cli_transcription_handle = None;
         self.update_cli_mic_button_state(ctx);
     }
 
@@ -1469,24 +1454,36 @@ impl AgentInputFooter {
         if let voice_input::VoiceInputToggledFrom::Key { state } = source {
             match (&self.cli_voice_input_state, state) {
                 (CLIVoiceInputState::Stopped, warpui::event::KeyState::Released) => return,
-                (CLIVoiceInputState::Listening, warpui::event::KeyState::Pressed) => return,
-                _ => {}
+                (CLIVoiceInputState::Listening { .. }, warpui::event::KeyState::Pressed) => return,
+                (
+                    CLIVoiceInputState::Listening { enabled_from },
+                    warpui::event::KeyState::Released,
+                ) if !matches!(
+                    enabled_from,
+                    voice_input::VoiceInputToggledFrom::Key {
+                        state: warpui::event::KeyState::Pressed
+                    }
+                ) =>
+                {
+                    return;
+                }
+                (CLIVoiceInputState::Stopped, warpui::event::KeyState::Pressed)
+                | (CLIVoiceInputState::Listening { .. }, warpui::event::KeyState::Released) => {}
             }
         }
 
         match &self.cli_voice_input_state {
             CLIVoiceInputState::Stopped => {
-                // Zap(Phase 3c A1):删除 `AIRequestUsageModel::can_request_voice`
-                // 额度闸。本地化后语音输入不受云端额度限制，统一可发送。
-
                 let session_result = voice_input::VoiceInput::handle(ctx)
                     .update(ctx, |voice_input, ctx| {
-                        voice_input.start_listening(ctx, source.clone())
+                        voice_input.start_listening(source.clone(), ctx)
                     });
 
                 match session_result {
-                    Ok(session) => {
-                        self.cli_voice_input_state = CLIVoiceInputState::Listening;
+                    Ok(event_rx) => {
+                        self.cli_voice_input_state = CLIVoiceInputState::Listening {
+                            enabled_from: source.clone(),
+                        };
                         self.update_cli_mic_button_state(ctx);
 
                         if let Some(agent) = self.cli_agent(ctx) {
@@ -1502,10 +1499,7 @@ impl AgentInputFooter {
                             self.maybe_show_first_time_cli_voice_toast(ctx);
                         }
 
-                        ctx.spawn(
-                            async move { session.await_result().await },
-                            Self::handle_cli_voice_session_result,
-                        );
+                        ctx.spawn_stream_local(event_rx, Self::handle_cli_voice_event, |_, _| {});
                     }
                     Err(StartListeningError::AccessDenied) => {
                         self.show_cli_microphone_access_toast(ctx);
@@ -1515,96 +1509,61 @@ impl AgentInputFooter {
                     }
                 }
             }
-            CLIVoiceInputState::Listening => {
-                voice_input::VoiceInput::handle(ctx).update(ctx, |voice_input, ctx| {
-                    if let Err(e) = voice_input.stop_listening(ctx) {
+            CLIVoiceInputState::Listening { .. } => {
+                voice_input::VoiceInput::handle(ctx).update(ctx, |voice_input, _ctx| {
+                    if let Err(e) = voice_input.stop_listening() {
                         log::error!("Failed to stop CLI voice input: {e:?}");
                     }
                 });
             }
-            CLIVoiceInputState::Transcribing => {
-                // Don't allow toggling while transcribing.
-            }
         }
         ctx.notify();
     }
 
     #[cfg(feature = "voice_input")]
-    fn handle_cli_voice_session_result(
+    fn handle_cli_voice_event(
         &mut self,
-        result: VoiceSessionResult,
+        event: voice_input::VoiceSessionEvent,
         ctx: &mut ViewContext<Self>,
     ) {
-        use crate::editor::VoiceTranscriber;
-
-        match result {
-            VoiceSessionResult::Audio {
-                wav_base64,
-                session_duration_ms: _,
-            } => {
-                let voice_transcriber = VoiceTranscriber::as_ref(ctx);
-                if let Some(transcriber) = voice_transcriber.transcriber() {
-                    let transcriber = transcriber.clone();
-                    self.cli_voice_input_state = CLIVoiceInputState::Transcribing;
-
-                    voice_input::VoiceInput::handle(ctx).update(ctx, |voice, _| {
-                        voice.set_transcribing_active(true);
-                    });
-
-                    self.cli_transcription_handle = Some(ctx.spawn(
-                        async move { transcriber.transcribe(wav_base64).await },
-                        Self::apply_cli_transcribed_voice_input,
-                    ));
-                } else {
-                    self.cli_voice_input_state = CLIVoiceInputState::Stopped;
-                }
+        match event {
+            voice_input::VoiceSessionEvent::Hypothesis { text } => {
+                log::debug!("CLI voice hypothesis: {text}");
             }
-            VoiceSessionResult::Aborted { .. } => {
-                self.cli_voice_input_state = CLIVoiceInputState::Stopped;
-            }
-        }
-        self.update_cli_mic_button_state(ctx);
-        ctx.notify();
-    }
-
-    #[cfg(feature = "voice_input")]
-    fn apply_cli_transcribed_voice_input(
-        &mut self,
-        result: Result<String, TranscribeError>,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        voice_input::VoiceInput::handle(ctx).update(ctx, |voice, _| {
-            voice.set_transcribing_active(false);
-        });
-
-        match result {
-            Ok(transcribed_text) => {
-                if !transcribed_text.is_empty() {
+            voice_input::VoiceSessionEvent::Final { text } => {
+                if !text.is_empty() {
                     if self.has_active_cli_agent_input_session(ctx) {
-                        ctx.emit(AgentInputFooterEvent::InsertIntoCLIRichInput(
-                            transcribed_text,
-                        ));
+                        ctx.emit(AgentInputFooterEvent::InsertIntoCLIRichInput(text));
                     } else {
-                        ctx.emit(AgentInputFooterEvent::WriteToPty(transcribed_text));
+                        ctx.emit(AgentInputFooterEvent::WriteToPty(text));
                     }
                 }
             }
-            Err(e) => match e {
-                TranscribeError::QuotaLimit => {
-                    self.show_cli_voice_error_toast(crate::t!("voice-input-limit-reached"), ctx);
+            voice_input::VoiceSessionEvent::Completed { .. } => {
+                log::info!("CLI voice session completed");
+                self.cli_voice_input_state = CLIVoiceInputState::Stopped;
+            }
+            voice_input::VoiceSessionEvent::Canceled { .. } => {
+                log::info!("CLI voice session canceled");
+                self.cli_voice_input_state = CLIVoiceInputState::Stopped;
+            }
+            voice_input::VoiceSessionEvent::Error(err) => {
+                log::error!("CLI voice session error: {err}");
+                match err {
+                    VoiceSessionError::SpeechPrivacyPolicyNotAccepted => {
+                        self.show_cli_speech_privacy_toast(ctx);
+                    }
+                    VoiceSessionError::Other(_) => {
+                        self.show_cli_voice_error_toast(
+                            crate::t!("voice-input-transcription-failed"),
+                            ctx,
+                        );
+                    }
                 }
-                _ => {
-                    log::error!("Failed to transcribe CLI voice input: {e:?}");
-                    self.show_cli_voice_error_toast(
-                        crate::t!("voice-input-transcription-failed"),
-                        ctx,
-                    );
-                }
-            },
+                self.cli_voice_input_state = CLIVoiceInputState::Stopped;
+            }
         }
 
-        self.cli_voice_input_state = CLIVoiceInputState::Stopped;
-        self.cli_transcription_handle = None;
         self.update_cli_mic_button_state(ctx);
         ctx.notify();
     }
@@ -1613,15 +1572,12 @@ impl AgentInputFooter {
     fn update_cli_mic_button_state(&self, ctx: &mut ViewContext<Self>) {
         let icon = match &self.cli_voice_input_state {
             CLIVoiceInputState::Stopped => Icon::Microphone,
-            CLIVoiceInputState::Listening => Icon::Stop,
-            CLIVoiceInputState::Transcribing => Icon::DotsHorizontal,
+            CLIVoiceInputState::Listening { .. } => Icon::Stop,
         };
-        let is_transcribing =
-            matches!(self.cli_voice_input_state, CLIVoiceInputState::Transcribing);
 
         self.mic_button.update(ctx, |button, ctx| {
             button.set_icon(Some(icon), ctx);
-            button.set_active(is_transcribing, ctx);
+            button.set_active(false, ctx);
         });
     }
 
@@ -1640,6 +1596,17 @@ impl AgentInputFooter {
         ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
             let toast = DismissibleToast::error(String::from(crate::t!(
                 "voice-input-microphone-access-error"
+            )));
+            toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+        });
+    }
+
+    #[cfg(feature = "voice_input")]
+    fn show_cli_speech_privacy_toast(&self, ctx: &mut ViewContext<Self>) {
+        let window_id = ctx.window_id();
+        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            let toast = DismissibleToast::error(String::from(crate::t!(
+                "voice-input-speech-privacy-error"
             )));
             toast_stack.add_ephemeral_toast(toast, window_id, ctx);
         });

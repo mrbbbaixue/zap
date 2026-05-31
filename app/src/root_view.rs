@@ -2389,6 +2389,7 @@ impl RootView {
         ctx: &mut ViewContext<Self>,
     ) -> bool {
         use crate::settings::AISettings;
+        use std::time::Duration;
         use voice_input::{VoiceInput, VoiceInputState, VoiceInputToggledFrom};
         use warpui::event::KeyState;
 
@@ -2399,8 +2400,11 @@ impl RootView {
             if configured_key_code == *key_code {
                 let voice_input = VoiceInput::handle(ctx);
                 // Check if we're actively listening and it was started from a key press.
-                if let VoiceInputState::Listening { enabled_from, .. } =
-                    voice_input.as_ref(ctx).state()
+                if let VoiceInputState::Listening {
+                    enabled_from,
+                    session_start,
+                    ..
+                } = voice_input.as_ref(ctx).state()
                 {
                     if matches!(
                         enabled_from,
@@ -2408,10 +2412,22 @@ impl RootView {
                             state: KeyState::Pressed
                         }
                     ) {
+                        // Windows Alt 键会在按下后由系统菜单循环触发瞬时 release，
+                        // 需忽略 listen 时间过短的释放事件。
+                        const MIN_KEY_HOLD_DURATION: Duration = Duration::from_millis(150);
+                        if session_start.elapsed() < MIN_KEY_HOLD_DURATION {
+                            log::debug!(
+                                "Voice input key released too quickly ({:?} < {:?}), ignoring",
+                                session_start.elapsed(),
+                                MIN_KEY_HOLD_DURATION,
+                            );
+                            return true;
+                        }
+
                         log::debug!("Voice input key release detected: {key_code:?}");
                         // Stop listening and proceed to transcription (don't abort).
-                        voice_input.update(ctx, |voice_input, ctx| {
-                            if let Err(e) = voice_input.stop_listening(ctx) {
+                        voice_input.update(ctx, |voice_input, _ctx| {
+                            if let Err(e) = voice_input.stop_listening() {
                                 log::error!("Failed to stop voice input on key release: {e:?}");
                             }
                         });

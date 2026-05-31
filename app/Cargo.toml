@@ -207,6 +207,7 @@ warp_ssh_manager.workspace = true
 warp_util.workspace = true
 warpui = { workspace = true, features = ["schema_gen", "settings_value"] }
 voice_input = { workspace = true, optional = true }
+voice_transcription.workspace = true
 warpui_extras = { workspace = true, features = ["default", "user_preferences-toml"] }
 syntax_tree.workspace = true
 languages.workspace = true

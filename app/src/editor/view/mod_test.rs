@@ -53,6 +53,49 @@ fn initialize_app(app: &mut App) {
 }
 
 #[test]
+#[cfg(feature = "voice_input")]
+fn voice_hypothesis_replaces_live_text() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let (_, editor) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
+            EditorView::new_with_base_text("", Default::default(), ctx)
+        });
+
+        editor.update(&mut app, |editor, ctx| {
+            editor.set_interaction_state(InteractionState::Selectable, ctx);
+
+            editor.handle_voice_event(
+                voice_input::VoiceSessionEvent::Hypothesis {
+                    text: "hel".to_string(),
+                },
+                ctx,
+            );
+            assert_eq!(editor.buffer_text(ctx), "hel");
+            assert_eq!(editor.interaction_state(ctx), InteractionState::Selectable);
+
+            editor.handle_voice_event(
+                voice_input::VoiceSessionEvent::Hypothesis {
+                    text: "hello".to_string(),
+                },
+                ctx,
+            );
+            assert_eq!(editor.buffer_text(ctx), "hello");
+
+            editor.handle_voice_event(
+                voice_input::VoiceSessionEvent::Final {
+                    text: "hello world".to_string(),
+                },
+                ctx,
+            );
+            assert_eq!(editor.buffer_text(ctx), "hello world");
+            assert_eq!(editor.selected_text(ctx), "");
+            assert_eq!(editor.interaction_state(ctx), InteractionState::Selectable);
+        });
+    });
+}
+
+#[test]
 fn test_selection_with_mouse() {
     App::test((), |mut app| async move {
         initialize_app(&mut app);

@@ -273,6 +273,62 @@ impl VoiceInputToggleKey {
     }
 }
 
+/// 语音转文字后端选择
+#[derive(
+    Default,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    PartialEq,
+    Eq,
+    Copy,
+    Clone,
+    EnumIter,
+    schemars::JsonSchema,
+    settings_value::SettingsValue,
+)]
+#[schemars(
+    description = "Voice transcription backend.",
+    rename_all = "snake_case"
+)]
+pub enum TranscriptionBackend {
+    /// 系统原生语音识别 (Windows / macOS)
+    #[default]
+    System,
+    /// 本地模型 (whisper-rs)
+    Local,
+    /// 云端 API (OpenAI 兼容协议)
+    Api,
+}
+
+settings::macros::implement_setting_for_enum!(
+    TranscriptionBackend,
+    AISettings,
+    SupportedPlatforms::DESKTOP,
+    SyncToCloud::Never,
+    private: false,
+    toml_path: "agents.voice.transcription_backend",
+    description: "Voice transcription backend.",
+);
+
+impl TranscriptionBackend {
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            TranscriptionBackend::System => "System Built-in",
+            TranscriptionBackend::Local => "Local Model",
+            TranscriptionBackend::Api => "Web API",
+        }
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            TranscriptionBackend::System => "Use the operating system's built-in real-time speech recognition (Windows: WinRT SpeechRecognition).",
+            TranscriptionBackend::Local => "Run a local Whisper model on your device. No internet required.",
+            TranscriptionBackend::Api => "Use a cloud API compatible with OpenAI Whisper API format.",
+        }
+    }
+}
+
 /// The default mode for new terminal sessions.
 #[derive(
     Default,
@@ -1293,6 +1349,8 @@ define_settings_group!(AISettings, settings: [
     // This field is used to store the key used for voice input toggling.
     // Note this is not the named key, but rather corresponds to the physical key.
     voice_input_toggle_key: VoiceInputToggleKey,
+    // 语音转文字后端选择: 系统原生 / 本地模型 / Web API
+    voice_transcription_backend: TranscriptionBackend,
     // This is not a user-visible setting - it's merely a one-time flag to track if the user has
     // explicitly interacted with voice input. We use this to determine whether we should show a toast
     // to inform the user about voice input and auto-set the keybinding.

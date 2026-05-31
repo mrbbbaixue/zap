@@ -1,0 +1,28 @@
+[package]
+name = "voice_transcription"
+edition = "2024"
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+async-channel = "2.3"
+
+[dev-dependencies]
+tokio = { version = "1.47.1", features = ["full"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tempfile.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_Speech",
+    "Win32_System_Com",
+    "Media_SpeechRecognition",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+] }
+windows-core.workspace = true

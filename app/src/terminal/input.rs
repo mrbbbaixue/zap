@@ -2314,6 +2314,13 @@ impl Input {
                     });
                 }
             });
+            // Sync voice input handling: when CLI agent input is open, the
+            // terminal element (alt_screen/block_list) handles the voice key,
+            // so the editor should not also respond to the same key event.
+            #[cfg(feature = "voice_input")]
+            me.editor.update(ctx, |editor, _ctx| {
+                editor.set_voice_input_handled_by_ancestor(is_cli_agent_input);
+            });
             // Sync the editor text colors with the (now active or inactive)
             // alt-screen CLI agent background so input text stays legible.
             me.update_cli_agent_editor_text_colors(ctx);
@@ -5183,6 +5190,14 @@ impl Input {
         ctx: &mut ViewContext<Self>,
     ) {
         self.enter_ai_mode(ctx);
+        if matches!(
+            from,
+            voice_input::VoiceInputToggledFrom::Key {
+                state: warpui::event::KeyState::Pressed,
+            }
+        ) {
+            ctx.focus(&self.editor);
+        }
         let did_start_listening = self
             .editor
             .update(ctx, |editor, ctx| editor.toggle_voice_input(from, ctx));
@@ -9466,11 +9481,7 @@ impl Input {
                 if *is_listening || *is_transcribing {
                     // Show voice status as placeholder when the buffer is empty.
                     if self.editor.as_ref(ctx).is_empty(ctx) {
-                        let placeholder = if *is_listening {
-                            "Listening..."
-                        } else {
-                            "Transcribing..."
-                        };
+                        let placeholder = "Listening...";
                         self.editor.update(ctx, |editor, ctx| {
                             editor.set_placeholder_text(placeholder, ctx);
                         });

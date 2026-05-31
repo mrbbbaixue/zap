@@ -1899,6 +1899,10 @@ pub struct EditorView {
     #[cfg(feature = "voice_input")]
     voice_input_state: voice::VoiceInputState,
 
+    /// Whether the editor is currently showing a provisional voice transcription.
+    #[cfg(feature = "voice_input")]
+    voice_hypothesis_active: bool,
+
     /// The interaction state before voice input was activated, to restore when voice input ends.
     #[cfg(feature = "voice_input")]
     interaction_state_before_voice: Option<InteractionState>,
@@ -1914,6 +1918,15 @@ pub struct EditorView {
     /// The new feature popup for voice transcription.
     #[cfg(feature = "voice_input")]
     voice_new_feature_popup: ViewHandle<FeaturePopup>,
+
+    /// 按键按下时刻，用于去抖 Windows Alt 键的瞬时 press+release（菜单循环）。
+    #[cfg(feature = "voice_input")]
+    voice_input_key_press_time: Option<std::time::Instant>,
+
+    /// When true, a terminal ancestor element already handles the voice toggle key.
+    /// The editor should skip its own voice key handling to avoid duplicate triggers.
+    #[cfg(feature = "voice_input")]
+    voice_input_handled_by_ancestor: bool,
 
     context_model: Option<ModelHandle<BlocklistAIContextModel>>,
 
@@ -3211,11 +3224,17 @@ impl EditorView {
             #[cfg(feature = "voice_input")]
             voice_input_state: Default::default(),
             #[cfg(feature = "voice_input")]
+            voice_hypothesis_active: false,
+            #[cfg(feature = "voice_input")]
             interaction_state_before_voice: None,
             #[cfg(feature = "voice_input")]
             voice_transcription_options: Self::voice_options(ctx),
             #[cfg(feature = "voice_input")]
             voice_new_feature_popup: Self::create_voice_new_feature_popup(ctx),
+            #[cfg(feature = "voice_input")]
+            voice_input_key_press_time: None,
+            #[cfg(feature = "voice_input")]
+            voice_input_handled_by_ancestor: false,
             is_ai_input: false,
             convert_newline_to_space: options.convert_newline_to_space,
             context_model: None,
@@ -4968,7 +4987,16 @@ impl EditorView {
         );
     }
 
+    #[cfg(feature = "voice_input")]
+    pub fn set_voice_input_handled_by_ancestor(&mut self, value: bool) {
+        self.voice_input_handled_by_ancestor = value;
+    }
+
     fn voice_input_toggle_key_code(&self, ctx: &AppContext) -> Option<KeyCode> {
+        #[cfg(feature = "voice_input")]
+        if self.voice_input_handled_by_ancestor {
+            return None;
+        }
         let ai_settings_handle = &AISettings::handle(ctx);
         ai_settings_handle
             .as_ref(ctx)

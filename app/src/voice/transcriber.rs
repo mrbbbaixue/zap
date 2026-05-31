@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use voice_transcription::SystemSpeechRecognizer;
 use warpui::{Entity, SingletonEntity};
 
 #[derive(thiserror::Error, Debug)]
@@ -35,15 +36,7 @@ pub trait Transcriber: Send + Sync {
 }
 
 /// A voice transcriber that is enabled or disabled.
-///
-/// This is a singleton model that the app can decide to enable or disable.
-/// The editor does expect that it will exist as a singleton fetchable from app context
-/// either way though, and depending on whether the optional transcriber is set,
-/// the editor considers transcriber to be enabled or disabled.
-///
-/// We set it up this way to avoid the editor having a direct dependency on any server api.
 pub struct VoiceTranscriber {
-    /// The transcriber to use. If `None`, the transcriber is disabled.
     #[cfg_attr(not(feature = "voice_input"), allow(dead_code))]
     transcriber: Option<Arc<dyn Transcriber>>,
 }
@@ -55,14 +48,14 @@ impl VoiceTranscriber {
         }
     }
 
-    /// Zap(本地化,Phase 4):创建一个禁用的 transcriber。原语义上 `Some(...)`
-    /// 代表云端 STT 后端可用,`None` 代表 "transcriber disabled";本地化后云端
-    /// `ServerVoiceTranscriber`(调 server_api.transcribe 发 Wispr STT)不可用,改走该构造子。
     pub fn disabled() -> Self {
         Self { transcriber: None }
     }
 
-    /// Returns the transcriber if one is set.
+    pub fn from_option(transcriber: Option<Arc<dyn Transcriber>>) -> Self {
+        Self { transcriber }
+    }
+
     pub fn transcriber(&self) -> Option<&Arc<dyn Transcriber>> {
         self.transcriber.as_ref()
     }
@@ -73,3 +66,36 @@ impl Entity for VoiceTranscriber {
 }
 
 impl SingletonEntity for VoiceTranscriber {}
+
+/// 系统语音识别器 adapter，将 batch 接口适配到 `Transcriber` trait。
+/// SAPI COM 对象不能跨线程，每次 transcribe 在 blocking 线程内新建识别器。
+pub struct SystemSpeechRecognizerAdapter;
+
+impl SystemSpeechRecognizerAdapter {
+    pub fn new() -> Result<Self, voice_transcription::Error> {
+        SystemSpeechRecognizer::new()?;
+        Ok(Self)
+    }
+}
+
+#[async_trait]
+impl Transcriber for SystemSpeechRecognizerAdapter {
+    async fn transcribe(&self, wav_base64: String) -> Result<String, TranscribeError> {
+        use base64::Engine;
+        let wav_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&wav_base64)
+            .map_err(|e: base64::DecodeError| TranscribeError::Other(e.into()))?;
+
+        let text = tokio::task::spawn_blocking(move || {
+            let recognizer = SystemSpeechRecognizer::new()
+                .map_err(|e: voice_transcription::Error| TranscribeError::Other(e.into()))?;
+            recognizer
+                .transcribe_wav_bytes(&wav_bytes)
+                .map_err(|e: voice_transcription::Error| TranscribeError::Other(e.into()))
+        })
+        .await
+        .map_err(|e: tokio::task::JoinError| TranscribeError::Other(e.into()))??;
+
+        Ok(text)
+    }
+}

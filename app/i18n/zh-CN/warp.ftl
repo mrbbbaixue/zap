@@ -3195,6 +3195,7 @@ auth-open-page-manually-suffix = 然后手动打开页面。
 voice-try-input = 试用语音输入
 voice-input-enabled-toast = 语音输入已启用。你也可以按住 `{ $key }` 键激活语音输入（可在 设置 > AI > 语音 中配置）
 voice-input-microphone-access-error = 无法启动语音输入（可能需要启用麦克风访问权限）
+voice-input-speech-privacy-error = 无法启动语音输入。请在 Windows 设置 > 隐私和安全性 > 语音 中启用语音识别，然后重试。
 voice-transcription-disabled-microphone = 由于未授予麦克风访问权限，语音转写已禁用。
 voice-transcription = 语音转写
 voice-transcription-hold-key = 语音转写（按住 `{ $key }` 键）

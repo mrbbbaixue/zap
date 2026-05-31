@@ -123,7 +123,7 @@ use crate::{
     appearance::Appearance,
     editor::Event as EditorEvent,
     editor::{EditorView, TextOptions},
-    settings::{AISettings, VoiceInputToggleKey},
+    settings::{AISettings, TranscriptionBackend, VoiceInputToggleKey},
     ui_components::blended_colors,
     util::bindings,
     view_components::{Dropdown, DropdownItem},
@@ -320,6 +320,7 @@ pub struct AISettingsPageView {
     page: PageType<Self>,
     active_subpage: Option<AISubpage>,
     voice_input_toggle_key_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
+    voice_transcription_backend_dropdown: ViewHandle<Dropdown<AISettingsPageAction>>,
     local_only_icon_tooltip_states: RefCell<HashMap<String, MouseStateHandle>>,
     autodetection_denylist_editor: ViewHandle<EditorView>,
     autonomy_dropdown_menu: ViewHandle<Dropdown<AISettingsPageAction>>,
@@ -444,6 +445,38 @@ impl AISettingsPageView {
                         DropdownItem::new(
                             val.display_name(),
                             AISettingsPageAction::SetVoiceInputToggleKey(val),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
+            dropdown.set_selected_by_index(selected_index, ctx);
+
+            dropdown
+        });
+
+        let voice_transcription_backend_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(AI_SETTINGS_DROPDOWN_WIDTH);
+            if !AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+                dropdown.set_disabled(ctx);
+            }
+
+            // 只显示 System 后端；Local/API 尚未实现 realtime session。
+            let values: Vec<TranscriptionBackend> = vec![TranscriptionBackend::System];
+            let current_value = AISettings::as_ref(ctx).voice_transcription_backend.value();
+            let selected_index = values
+                .iter()
+                .position(|val| val == current_value)
+                .unwrap_or(0);
+
+            dropdown.add_items(
+                values
+                    .into_iter()
+                    .map(|val| {
+                        DropdownItem::new(
+                            val.display_name(),
+                            AISettingsPageAction::SetVoiceTranscriptionBackend(val),
                         )
                     })
                     .collect(),
@@ -1326,6 +1359,7 @@ impl AISettingsPageView {
             page: Self::build_page(None, ctx),
             active_subpage: None,
             voice_input_toggle_key_dropdown,
+            voice_transcription_backend_dropdown,
             autodetection_denylist_editor,
             local_only_icon_tooltip_states: Default::default(),
             command_execution_allowlist_editor,
@@ -1371,9 +1405,18 @@ impl AISettingsPageView {
 
     fn update_voice_input_dropdown_enablement(&mut self, ctx: &mut ViewContext<Self>) {
         let is_voice_enabled = AISettings::as_ref(ctx).is_voice_input_enabled(ctx);
+        let is_any_ai_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
         self.voice_input_toggle_key_dropdown
             .update(ctx, |dropdown, ctx| {
                 if is_voice_enabled {
+                    dropdown.set_enabled(ctx);
+                } else {
+                    dropdown.set_disabled(ctx);
+                }
+            });
+        self.voice_transcription_backend_dropdown
+            .update(ctx, |dropdown, ctx| {
+                if is_any_ai_enabled {
                     dropdown.set_enabled(ctx);
                 } else {
                     dropdown.set_disabled(ctx);
@@ -2174,6 +2217,7 @@ impl Entity for AISettingsPageView {
 pub enum AISettingsPageAction {
     OpenUrl(String),
     SetVoiceInputToggleKey(VoiceInputToggleKey),
+    SetVoiceTranscriptionBackend(TranscriptionBackend),
     ToggleActiveAI,
     ToggleIntelligentAutosuggestions,
     TogglePromptSuggestions,
@@ -2394,6 +2438,12 @@ impl TypedActionView for AISettingsPageView {
         match action {
             AISettingsPageAction::OpenUrl(url) => {
                 ctx.open_url(url.as_str());
+            }
+            AISettingsPageAction::SetVoiceTranscriptionBackend(backend) => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.voice_transcription_backend.set_value(*backend, ctx));
+                });
+                ctx.notify();
             }
             AISettingsPageAction::SetVoiceInputToggleKey(key) => {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
@@ -5807,6 +5857,40 @@ impl VoiceWidget {
                 &view.voice_input_toggle_key_dropdown,
             ));
         }
+
+        // 转写后端选择下拉菜单即使 Voice Input 关闭也要显示，方便用户先配置后端。
+        column.add_child(render_dropdown_item(
+            appearance,
+            "Transcription Backend",
+            Some("Choose how your voice input is transcribed to text."),
+            None,
+            LocalOnlyIconState::for_setting(
+                TranscriptionBackend::storage_key(),
+                TranscriptionBackend::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            (!is_toggleable).then(|| appearance.theme().disabled_ui_text_color()),
+            &view.voice_transcription_backend_dropdown,
+        ));
+
+        let desc_text = FormattedTextElement::new(
+            FormattedText::new([FormattedTextLine::Line(vec![
+                FormattedTextFragment::plain_text(TranscriptionBackend::System.description()),
+            ])]),
+            appearance.ui_font_size(),
+            appearance.ui_font_family(),
+            appearance.ui_font_family(),
+            styles::description_font_color(is_toggleable, app).into(),
+            HighlightedHyperlink::default(),
+        );
+        column.add_child(
+            Container::new(desc_text.finish())
+                .with_margin_top(styles::DESCRIPTION_NEGATIVE_MARGIN_OFFSET)
+                .with_margin_bottom(styles::DESCRIPTION_MARGIN_BOTTOM)
+                .with_margin_right(styles::TOGGLE_WIDTH_MARGIN)
+                .finish(),
+        );
 
         column.finish()
     }

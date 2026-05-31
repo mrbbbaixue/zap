@@ -149,7 +149,6 @@ use code::editor_management::CodeManager;
 use code::opened_files::OpenedFilesModel;
 use code_review::GlobalCodeReviewModel;
 use quit_warning::UnsavedStateSummary;
-// Zap(本地化,Phase 4):`ServerVoiceTranscriber` 原用于默认 VoiceTranscriber 注入,现走 `VoiceTranscriber::disabled()`,同名 import 暂收。
 #[cfg(feature = "local_fs")]
 use settings::import::model::ImportedConfigModel;
 use voice::transcriber::VoiceTranscriber;
@@ -1531,12 +1530,8 @@ fn initialize_app(
 
     #[cfg(feature = "voice_input")]
     ctx.add_singleton_model(voice_input::VoiceInput::new);
-    ctx.add_singleton_model(|_| {
-        // Zap(本地化,Phase 4):原默认注入 `ServerVoiceTranscriber` 走云端 Wispr STT。
-        // 本地化场景下云端语音转写不可用,改为 `disabled()` 让上层 `transcriber()` 返 None,
-        // 语音输入 UI 变为只采集不转写(后续接入本地 STT 补上)。
-        VoiceTranscriber::disabled()
-    });
+    // Batch transcriber is no longer used as the main path; keep a disabled legacy singleton.
+    ctx.add_singleton_model(|_ctx| VoiceTranscriber::disabled());
 
     timer.mark_interval_end("CORE_SINGLETONS_REGISTERED");
 

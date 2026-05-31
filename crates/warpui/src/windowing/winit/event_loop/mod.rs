@@ -26,6 +26,7 @@ use winit::{
 
 use crate::actions::StandardAction;
 use crate::event::ModifiersState;
+use crate::platform::keyboard::KeyCode as WarpKeyCode;
 use crate::platform::NotificationInfo;
 use crate::platform::OperatingSystem;
 use crate::platform::{
@@ -88,21 +89,35 @@ const MIN_VELOCITY_TIME_DELTA: f32 = 0.004; // Floor for time deltas to prevent 
 /// TryFrom implementation for converting winit's `KeyCode` to
 /// `crate::platform::keyboard::KeyCode`.
 /// Only converts modifier keys and fails for all other keys.
-fn try_from_winit_keycode(keycode: &KeyCode) -> Result<crate::platform::keyboard::KeyCode, ()> {
+fn try_from_winit_keycode(keycode: &KeyCode) -> Result<WarpKeyCode, ()> {
     match keycode {
-        KeyCode::AltLeft => Ok(crate::platform::keyboard::KeyCode::AltLeft),
-        KeyCode::AltRight => Ok(crate::platform::keyboard::KeyCode::AltRight),
-        KeyCode::ShiftLeft => Ok(crate::platform::keyboard::KeyCode::ShiftLeft),
-        KeyCode::ShiftRight => Ok(crate::platform::keyboard::KeyCode::ShiftRight),
-        KeyCode::ControlLeft => Ok(crate::platform::keyboard::KeyCode::ControlLeft),
-        KeyCode::ControlRight => Ok(crate::platform::keyboard::KeyCode::ControlRight),
-        KeyCode::SuperLeft => Ok(crate::platform::keyboard::KeyCode::SuperLeft),
-        KeyCode::SuperRight => Ok(crate::platform::keyboard::KeyCode::SuperRight),
+        KeyCode::AltLeft => Ok(WarpKeyCode::AltLeft),
+        KeyCode::AltRight => Ok(WarpKeyCode::AltRight),
+        KeyCode::ShiftLeft => Ok(WarpKeyCode::ShiftLeft),
+        KeyCode::ShiftRight => Ok(WarpKeyCode::ShiftRight),
+        KeyCode::ControlLeft => Ok(WarpKeyCode::ControlLeft),
+        KeyCode::ControlRight => Ok(WarpKeyCode::ControlRight),
+        KeyCode::SuperLeft => Ok(WarpKeyCode::SuperLeft),
+        KeyCode::SuperRight => Ok(WarpKeyCode::SuperRight),
         // Note that the Fn key is not well identified on Windows laptops (e.g.
         // winit wasn't able to identify it correctly on ThinkPad). But, if it's
         // identified, we still pass it on to the UI framework.
-        KeyCode::Fn => Ok(crate::platform::keyboard::KeyCode::Fn),
+        KeyCode::Fn => Ok(WarpKeyCode::Fn),
         _ => Err(()),
+    }
+}
+
+fn modifier_key_from_physical_key(physical_key: &keyboard::PhysicalKey) -> Option<WarpKeyCode> {
+    match physical_key {
+        keyboard::PhysicalKey::Code(keycode) => try_from_winit_keycode(keycode).ok(),
+        keyboard::PhysicalKey::Unidentified(_) => None,
+    }
+}
+
+fn key_state_from_element_state(state: ElementState) -> crate::event::KeyState {
+    match state {
+        ElementState::Pressed => crate::event::KeyState::Pressed,
+        ElementState::Released => crate::event::KeyState::Released,
     }
 }
 
@@ -149,6 +164,8 @@ struct WindowState {
     left_alt_pressed: bool,
     /// Whether the right Alt key is currently pressed. See [`Self::left_alt_pressed`].
     right_alt_pressed: bool,
+    raw_modifier_states: HashMap<WarpKeyCode, ElementState>,
+    dispatched_modifier_states: HashMap<WarpKeyCode, ElementState>,
     /// The currently-pressed mouse button, if any. Set back to None when the button is released.
     ///
     /// This ultimately should be a HashSet of mouse buttons, as more than one
@@ -185,6 +202,8 @@ impl WindowState {
             modifiers: Default::default(),
             left_alt_pressed: false,
             right_alt_pressed: false,
+            raw_modifier_states: Default::default(),
+            dispatched_modifier_states: Default::default(),
             current_mouse_button_pressed: None,
             last_mouse_button_pressed: None,
             last_cursor_position: Default::default(),
@@ -849,6 +868,16 @@ impl EventLoop {
                     },
                 );
             }
+            Event::DeviceEvent {
+                event:
+                    winit::event::DeviceEvent::Key(winit::event::RawKeyEvent {
+                        physical_key,
+                        state,
+                    }),
+                ..
+            } => {
+                self.handle_raw_modifier_key_event(&physical_key, state);
+            }
             Event::WindowEvent {
                 window_id,
                 event: WindowEvent::RedrawRequested,
@@ -1294,14 +1323,37 @@ impl EventLoop {
 
                 // If the event is a modifier key, just by itself, we handle it specially, issuing
                 // the appropriate Zap-side event (ModifierKeyChanged).
-                if let (None, keyboard::PhysicalKey::Code(keycode)) =
-                    (&event.text, &event.physical_key)
-                {
-                    if let Ok(mapped_keycode) = try_from_winit_keycode(keycode) {
-                        return Some(ConvertedEvent::ModifierKeyChanged {
-                            key_code: mapped_keycode,
-                            state: event.state,
-                        });
+                // `is_synthetic` is checked here to match the filter in
+                // `convert_keyboard_input_event`.
+                if !is_synthetic {
+                    if let (text, keyboard::PhysicalKey::Code(keycode)) =
+                        (&event.text, &event.physical_key)
+                    {
+                        // Windows sends text=Some("") for modifier-only events;
+                        // other platforms send text=None. Accept both so the press is
+                        // not silently dropped (*then* the release-only dispatch would
+                        // cause the "fires both pressed+released" symptom).
+                        if text.as_ref().map_or(true, |s| s.is_empty()) {
+                            if let Ok(mapped_keycode) = try_from_winit_keycode(keycode) {
+                                if window_state
+                                    .raw_modifier_states
+                                    .contains_key(&mapped_keycode)
+                                {
+                                    return None;
+                                }
+                                if window_state
+                                    .dispatched_modifier_states
+                                    .insert(mapped_keycode, event.state)
+                                    .is_some_and(|previous_state| previous_state == event.state)
+                                {
+                                    return None;
+                                }
+                                return Some(ConvertedEvent::ModifierKeyChanged {
+                                    key_code: mapped_keycode,
+                                    state: event.state,
+                                });
+                            }
+                        }
                     }
                 }
 
@@ -1340,6 +1392,8 @@ impl EventLoop {
                 if !is_focused {
                     window_state.left_alt_pressed = false;
                     window_state.right_alt_pressed = false;
+                    window_state.raw_modifier_states.clear();
+                    window_state.dispatched_modifier_states.clear();
                 }
 
                 // On the next tick of the event loop, notify the ui_app that focus has
@@ -1763,6 +1817,69 @@ impl EventLoop {
                     .dispatch_standard_action(active_window_id, StandardAction::Paste);
             }
         }
+    }
+
+    fn handle_raw_modifier_key_event(
+        &mut self,
+        physical_key: &keyboard::PhysicalKey,
+        state: ElementState,
+    ) {
+        let Some(key_code) = modifier_key_from_physical_key(physical_key) else {
+            return;
+        };
+
+        let Some(active_window_id) = self.ui_app.read(|ctx| ctx.windows().active_window()) else {
+            return;
+        };
+
+        let Some((winit_window_id, window_state)) = self
+            .state
+            .windows
+            .iter_mut()
+            .find(|(_, state)| state.window_id == active_window_id)
+        else {
+            return;
+        };
+
+        if window_state
+            .raw_modifier_states
+            .insert(key_code, state)
+            .is_some_and(|previous_state| previous_state == state)
+        {
+            return;
+        }
+
+        let already_dispatched = window_state
+            .dispatched_modifier_states
+            .insert(key_code, state)
+            .is_some_and(|previous_state| previous_state == state);
+
+        if key_code == WarpKeyCode::AltLeft {
+            window_state.left_alt_pressed = state == ElementState::Pressed;
+        } else if key_code == WarpKeyCode::AltRight {
+            window_state.right_alt_pressed = state == ElementState::Pressed;
+        }
+
+        if already_dispatched {
+            return;
+        }
+
+        let Some(window) = self
+            .ui_app
+            .read(|ctx| ctx.windows().platform_window(active_window_id))
+        else {
+            return;
+        };
+
+        log::trace!(
+            "Dispatching raw modifier event for {key_code:?}: {state:?} on {winit_window_id:?}"
+        );
+
+        let mut window_callbacks = self.callbacks.for_window(window.as_ref());
+        window_callbacks.dispatch_event(crate::event::Event::ModifierKeyChanged {
+            key_code,
+            state: key_state_from_element_state(state),
+        });
     }
 
     /// Starts a timer that triggers MomentumScroll events at a fixed interval.

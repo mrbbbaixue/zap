@@ -3280,6 +3280,7 @@ auth-open-page-manually-suffix = and open the page manually.
 voice-try-input = Try Voice Input
 voice-input-enabled-toast = Voice input is enabled. You can also press and hold the `{ $key }` key to activate voice input (configure in Settings > AI > Voice)
 voice-input-microphone-access-error = Failed to start voice input (you may need to enable Microphone access)
+voice-input-speech-privacy-error = Failed to start voice input. Enable speech recognition in Windows Settings > Privacy & security > Speech, then try again.
 voice-transcription-disabled-microphone = Voice transcription is disabled because Microphone access was not granted.
 voice-transcription = Voice transcription
 voice-transcription-hold-key = Voice transcription (hold `{ $key }` key)
