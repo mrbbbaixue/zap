@@ -3870,6 +3870,24 @@ impl Workspace {
         });
     }
 
+    /// 新建终端标签页，然后执行 resume 命令恢复 CLI agent 历史会话。
+    fn resume_cli_agent_session(
+        &mut self,
+        _agent_name: &str,
+        resume_command: &str,
+        _working_directory: Option<&str>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.add_terminal_tab(false, ctx);
+        self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
+            if let Some(terminal_view) = pane_group.active_session_view(ctx) {
+                terminal_view.update(ctx, |view, ctx| {
+                    view.execute_command_or_set_pending(resume_command, ctx);
+                });
+            }
+        });
+    }
+
     fn toggle_ai_assistant_panel(&mut self, ctx: &mut ViewContext<Self>) {
         // Now that the user has interacted with the panel, we can close
         // the dialogue and mark it as dismissed.
@@ -5274,6 +5292,19 @@ impl Workspace {
             }
             LeftPanelEvent::NewConversationInNewTab => {
                 self.add_terminal_tab_with_new_agent_view(ctx);
+            }
+            LeftPanelEvent::ResumeCLIAgentSession {
+                session_id: _,
+                agent_name,
+                resume_command,
+                working_directory,
+            } => {
+                self.resume_cli_agent_session(
+                    agent_name,
+                    resume_command,
+                    working_directory.as_deref(),
+                    ctx,
+                );
             }
             LeftPanelEvent::ShowDeleteConfirmationDialog {
                 conversation_id,

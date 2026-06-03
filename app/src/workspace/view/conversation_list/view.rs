@@ -16,9 +16,11 @@ use crate::view_components::DismissibleToast;
 use crate::workspace::global_actions::ForkedConversationDestination;
 use crate::workspace::header_toolbar_item::HeaderToolbarItemKind;
 use crate::workspace::tab_settings::TabSettings;
+use crate::ai::cli_agent_session_scanner::DiscoveredCLIAgentSession;
+use crate::terminal::CLIAgent;
 use crate::workspace::view::conversation_list::item::{
-    render_item, render_static_item, ItemProps, ItemState, OverflowMenuDisplay, StaticItemProps,
-    STATIC_ITEM_MIN_HEIGHT,
+    render_cli_agent_session_item, render_item, render_static_item, CLIAgentItemProps, ItemProps,
+    ItemState, OverflowMenuDisplay, StaticItemProps, STATIC_ITEM_MIN_HEIGHT,
 };
 use crate::workspace::view::conversation_list::view_model::ConversationOrTaskId;
 use crate::workspace::ToastStack;
@@ -85,12 +87,14 @@ pub enum ConversationSection {
 enum ListItem {
     SectionHeader(ConversationSection),
     Conversation(ConversationEntry),
+    /// 第三方 CLI agent 历史会话。
+    CLIAgentSession(ConversationEntry),
     /// The "+ New conversation" item at the end of the active section.
     StartNewConversation,
     ToggleViewAllButton,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct OverflowMenuState {
     conversation_id: ConversationOrTaskId,
     /// When `Some`, the menu was opened via right-click and should be
@@ -130,12 +134,21 @@ pub enum ConversationListViewAction {
     },
 }
 
+/// 重绘后，对话列表从 ViewModel 读取已缓存的条目列表，不再和 AgentConversationsModel
+/// 直接交互。
 pub enum Event {
     NewConversationInNewTab,
     ShowDeleteConfirmationDialog {
         conversation_id: AIConversationId,
         conversation_title: String,
         terminal_view_id: Option<EntityId>,
+    },
+    /// 用户点击了第三方 CLI agent 的历史会话，需要执行 resume。
+    ResumeCLIAgentSession {
+        session_id: String,
+        agent_type: CLIAgent,
+        resume_command: String,
+        working_directory: Option<String>,
     },
 }
 
@@ -270,7 +283,13 @@ impl ConversationListView {
         let past_items: Vec<ListItem> = model
             .filtered_items()
             .iter()
-            .map(|entry| ListItem::Conversation(entry.clone()))
+            .map(|entry| {
+                if ConversationListViewModel::is_cli_agent_session(&entry.id) {
+                    ListItem::CLIAgentSession(entry.clone())
+                } else {
+                    ListItem::Conversation(entry.clone())
+                }
+            })
             .collect();
 
         let mut items = Vec::new();
@@ -377,7 +396,7 @@ impl ConversationListView {
 
     fn is_selectable(&self, index: usize) -> bool {
         self.get_list_item(index).is_some_and(|item| match item {
-            ListItem::Conversation(_) | ListItem::StartNewConversation => true,
+            ListItem::Conversation(_) | ListItem::CLIAgentSession(_) | ListItem::StartNewConversation => true,
             ListItem::SectionHeader(_) | ListItem::ToggleViewAllButton => false,
         })
     }
@@ -492,6 +511,18 @@ impl ConversationListView {
                     Self::send_open_telemetry(&entry.id, ctx);
                     ctx.dispatch_typed_action(&action);
                 }
+            }
+            ListItem::CLIAgentSession(entry) => {
+                let model = self.view_model.as_ref(ctx);
+                let Some(session) = model.get_cli_agent_session(&entry.id) else {
+                    return;
+                };
+                ctx.emit(Event::ResumeCLIAgentSession {
+                    session_id: session.session_id.clone(),
+                    agent_type: session.agent_type,
+                    resume_command: session.resume_command(),
+                    working_directory: session.working_directory.clone(),
+                });
             }
             ListItem::SectionHeader(_) | ListItem::ToggleViewAllButton => {}
         }
@@ -928,6 +959,21 @@ impl TypedActionView for ConversationListView {
             }
             ConversationListViewAction::OpenItem { id } => {
                 let model = self.view_model.as_ref(ctx);
+
+                // 处理 CLI agent 会话
+                if ConversationListViewModel::is_cli_agent_session(id) {
+                    let Some(session) = model.get_cli_agent_session(id) else {
+                        return;
+                    };
+                    ctx.emit(Event::ResumeCLIAgentSession {
+                        session_id: session.session_id.clone(),
+                        agent_type: session.agent_type,
+                        resume_command: session.resume_command(),
+                        working_directory: session.working_directory.clone(),
+                    });
+                    return;
+                }
+
                 let Some(item) = model.get_item_by_id(id, ctx) else {
                     return;
                 };
@@ -1125,6 +1171,41 @@ impl View for ConversationListView {
                                             highlight_indices: highlight_ref,
                                             is_selected,
                                             is_focused_conversation,
+                                            index,
+                                            state,
+                                            overflow_menu: &overflow_menu,
+                                            overflow_menu_display,
+                                            conversation_id: entry.id,
+                                            list_position_id: &list_position_id,
+                                            tooltip_opens_right,
+                                        },
+                                        app,
+                                    ))
+                                }
+                                ListItem::CLIAgentSession(entry) => {
+                                    let session = model.get_cli_agent_session(&entry.id)?;
+                                    let state = item_states.get(&entry.id)?;
+                                    let highlight_ref = if entry.highlight_indices.is_empty() {
+                                        None
+                                    } else {
+                                        Some(&entry.highlight_indices)
+                                    };
+
+                                    let overflow_menu_display = match overflow_menu_state {
+                                        Some(s) if s.conversation_id == entry.id => {
+                                            if s.position.is_some() {
+                                                OverflowMenuDisplay::OpenAtRightClickPosition
+                                            } else {
+                                                OverflowMenuDisplay::OpenAtKebab
+                                            }
+                                        }
+                                        _ => OverflowMenuDisplay::Closed,
+                                    };
+                                    Some(render_cli_agent_session_item(
+                                        CLIAgentItemProps {
+                                            session,
+                                            highlight_indices: highlight_ref,
+                                            is_selected,
                                             index,
                                             state,
                                             overflow_menu: &overflow_menu,

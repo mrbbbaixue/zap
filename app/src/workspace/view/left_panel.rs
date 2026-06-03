@@ -20,6 +20,7 @@ use warpui::{
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::ai::skills::{SkillManager, SkillOpenOrigin};
+use crate::terminal::CLIAgent;
 use crate::code::editor_management::CodeSource;
 #[cfg(feature = "local_fs")]
 use crate::code::file_tree::FileTreeEvent;
@@ -113,6 +114,12 @@ pub enum LeftPanelEvent {
         remote_path: crate::code::buffer_location::RemotePath,
     },
     NewConversationInNewTab,
+    ResumeCLIAgentSession {
+        session_id: String,
+        agent_name: String,
+        resume_command: String,
+        working_directory: Option<String>,
+    },
     ShowDeleteConfirmationDialog {
         conversation_id: AIConversationId,
         conversation_title: String,
@@ -319,6 +326,19 @@ impl LeftPanelView {
                     conversation_id: *conversation_id,
                     conversation_title: conversation_title.clone(),
                     terminal_view_id: *terminal_view_id,
+                });
+            }
+            ConversationListViewEvent::ResumeCLIAgentSession {
+                session_id,
+                agent_type,
+                resume_command,
+                working_directory,
+            } => {
+                ctx.emit(LeftPanelEvent::ResumeCLIAgentSession {
+                    session_id: session_id.clone(),
+                    agent_name: agent_type.display_name().to_string(),
+                    resume_command: resume_command.clone(),
+                    working_directory: working_directory.clone(),
                 });
             }
         });

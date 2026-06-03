@@ -1,13 +1,16 @@
 use crate::ai::agent_conversations_model::ConversationOrTask;
+use crate::ai::cli_agent_session_scanner::DiscoveredCLIAgentSession;
 use crate::ai::conversation_status_ui::{render_status_element, STATUS_ELEMENT_PADDING};
 use crate::appearance::Appearance;
 use crate::menu::Menu;
+use crate::terminal::CLIAgent;
 use crate::ui_components::icons::Icon;
 use crate::ui_components::menu_button::{icon_button_with_context_menu, MenuDirection};
 use crate::util::time_format::format_approx_duration_from_now_utc;
 use crate::util::truncation::truncate_from_end;
 use crate::workspace::view::conversation_list::view::ConversationListViewAction;
 use crate::workspace::view::conversation_list::view_model::ConversationOrTaskId;
+use chrono::{DateTime, Utc};
 use pathfinder_geometry::vector::vec2f;
 use warp_core::ui::color::coloru_with_opacity;
 use warp_core::ui::theme::color::internal_colors;
@@ -40,6 +43,9 @@ fn conversation_item_position_id(id: &ConversationOrTaskId) -> String {
             format!("conversation_list_item_{conv_id}")
         }
         ConversationOrTaskId::TaskId(task_id) => format!("conversation_list_task_{task_id}"),
+        ConversationOrTaskId::CLIAgentSession { session_id, .. } => {
+            format!("conversation_list_cli_{session_id}")
+        }
     }
 }
 
@@ -402,4 +408,261 @@ fn format_item_subtext(conversation: &ConversationOrTask) -> Option<String> {
             })
         }
     }
+}
+
+// ===== CLI Agent 会话渲染 =====
+
+pub struct CLIAgentItemProps<'a> {
+    pub session: &'a DiscoveredCLIAgentSession,
+    pub highlight_indices: Option<&'a Vec<usize>>,
+    pub is_selected: bool,
+    pub index: usize,
+    pub state: &'a ItemState,
+    pub overflow_menu: &'a ViewHandle<Menu<ConversationListViewAction>>,
+    pub overflow_menu_display: OverflowMenuDisplay,
+    pub conversation_id: ConversationOrTaskId,
+    pub list_position_id: &'a str,
+    pub tooltip_opens_right: bool,
+}
+
+/// 渲染第三方 CLI agent 会话条目。
+/// 显示 agent 品牌图标 + 标题 + agent 名称 + 时间戳。
+pub fn render_cli_agent_session_item(
+    props: CLIAgentItemProps<'_>,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let CLIAgentItemProps {
+        session,
+        highlight_indices,
+        is_selected,
+        index,
+        state,
+        overflow_menu,
+        overflow_menu_display,
+        conversation_id,
+        list_position_id,
+        tooltip_opens_right,
+    } = props;
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    let ui_builder = appearance.ui_builder().clone();
+    let font_family = appearance.ui_font_family();
+    let font_size = appearance.ui_font_size();
+    let title_font_size = font_size + 2.;
+
+    // 标题
+    let mut title_text =
+        Text::new_inline(&session.title, font_family, title_font_size)
+            .with_color(theme.main_text_color(theme.background()).into());
+    if let Some(indices) = highlight_indices {
+        if !indices.is_empty() {
+            let highlight = Highlight::new()
+                .with_properties(Properties::default().weight(Weight::Bold))
+                .with_text_style(
+                    TextStyle::new()
+                        .with_foreground_color(theme.main_text_color(theme.background()).into())
+                        .with_background_color(
+                            internal_colors::accent_overlay_3(theme).into_solid(),
+                        ),
+                );
+            title_text = title_text.with_single_highlight(highlight, indices.clone());
+        }
+    }
+
+    // Agent 品牌图标
+    let status_element_size = font_size + STATUS_ELEMENT_PADDING * 2.;
+    let icon_element: Box<dyn Element> = if let Some(agent_icon) = session.agent_type.icon() {
+        ConstrainedBox::new(
+            agent_icon
+                .to_warpui_icon(theme.sub_text_color(theme.background()))
+                .finish(),
+        )
+        .with_width(status_element_size)
+        .with_height(status_element_size)
+        .finish()
+    } else {
+        // 回退：通用 terminal 图标
+        ConstrainedBox::new(
+            Icon::Terminal
+                .to_warpui_icon(theme.sub_text_color(theme.background()))
+                .finish(),
+        )
+        .with_width(status_element_size)
+        .with_height(status_element_size)
+        .finish()
+    };
+
+    let icon_and_title_row = Shrinkable::new(
+        1.0,
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(ICON_SPACING)
+            .with_child(icon_element)
+            .with_child(Shrinkable::new(1.0, title_text.finish()).finish())
+            .finish(),
+    )
+    .finish();
+
+    let timestamp = Text::new_inline(
+        format_approx_duration_from_now_utc(session.last_updated),
+        font_family,
+        font_size - 2.,
+    )
+    .with_color(theme.sub_text_color(theme.background()).into())
+    .finish();
+
+    // Subtext: agent 名称 + 工作目录
+    let subtext = {
+        let agent_name = session.agent_type.display_name();
+        match &session.working_directory {
+            Some(pwd) => {
+                let home_dir = dirs::home_dir().and_then(|p| p.to_str().map(String::from));
+                let friendly = user_friendly_path(pwd, home_dir.as_deref());
+                Some(format!("{agent_name} · {friendly}"))
+            }
+            None => Some(agent_name.to_string()),
+        }
+    };
+
+    let bottom_row = if let Some(subtext) = subtext {
+        let subtext_element = Shrinkable::new(
+            1.0,
+            Text::new_inline(subtext, font_family, title_font_size - 2.)
+                .with_color(theme.sub_text_color(theme.background()).into())
+                .finish(),
+        )
+        .finish();
+
+        Container::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                .with_cross_axis_alignment(CrossAxisAlignment::End)
+                .with_child(subtext_element)
+                .with_child(timestamp)
+                .finish(),
+        )
+        .with_padding_left(status_element_size + ICON_SPACING)
+        .finish()
+    } else {
+        Container::new(
+            Flex::row()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_main_axis_alignment(MainAxisAlignment::End)
+                .with_child(timestamp)
+                .finish(),
+        )
+        .with_padding_left(status_element_size + ICON_SPACING)
+        .finish()
+    };
+
+    let row = Flex::column()
+        .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+        .with_child(icon_and_title_row)
+        .with_child(bottom_row)
+        .finish();
+
+    let title = session.title.clone();
+    let tooltip_text = truncate_from_end(&title, MAX_TOOLTIP_LENGTH);
+    let overflow_button_state = state.overflow_button_state.clone();
+    let hoverable = Hoverable::new(state.mouse_state.clone(), move |_| {
+        let container = Container::new(row)
+            .with_horizontal_padding(12.)
+            .with_padding_top(8.);
+
+        let container = if is_selected || !matches!(overflow_menu_display, OverflowMenuDisplay::Closed) {
+            container.with_background(theme.surface_overlay_1())
+        } else {
+            container
+        };
+
+        let mut stack = Stack::new().with_child(container.finish());
+        if is_selected || !matches!(overflow_menu_display, OverflowMenuDisplay::Closed) {
+            let button_style = UiComponentStyles::default()
+                .set_background(theme.surface_2().into())
+                .set_border_color(theme.surface_3().into());
+            let menu_direction = if tooltip_opens_right {
+                MenuDirection::Right
+            } else {
+                MenuDirection::Left
+            };
+            let overflow_button = icon_button_with_context_menu(
+                Icon::DotsVertical,
+                move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ConversationListViewAction::ToggleOverflowMenu {
+                        conversation_id,
+                        position: None,
+                    });
+                },
+                overflow_button_state.clone(),
+                overflow_menu,
+                matches!(overflow_menu_display, OverflowMenuDisplay::OpenAtKebab),
+                menu_direction,
+                Some(Cursor::PointingHand),
+                Some(button_style),
+                appearance,
+            );
+            let overflow_offset = OffsetPositioning::offset_from_parent(
+                vec2f(-8., 6.),
+                ParentOffsetBounds::ParentByPosition,
+                ParentAnchor::TopRight,
+                ChildAnchor::TopRight,
+            );
+            stack.add_positioned_child(overflow_button.finish(), overflow_offset);
+        }
+        if is_selected && matches!(overflow_menu_display, OverflowMenuDisplay::Closed) {
+            let tooltip = ui_builder.tool_tip(tooltip_text).build().finish();
+            let (parent_anchor, child_anchor, offset_x) = if tooltip_opens_right {
+                (ParentAnchor::MiddleRight, ChildAnchor::MiddleLeft, 4.)
+            } else {
+                (ParentAnchor::MiddleLeft, ChildAnchor::MiddleRight, -4.)
+            };
+            let tooltip_offset = OffsetPositioning::offset_from_parent(
+                vec2f(offset_x, 0.),
+                ParentOffsetBounds::WindowByPosition,
+                parent_anchor,
+                child_anchor,
+            );
+            stack.add_positioned_overlay_child(tooltip, tooltip_offset);
+        }
+        stack.finish()
+    })
+    .with_cursor(Cursor::PointingHand)
+    .on_click(move |ctx, _, _| {
+        ctx.dispatch_typed_action(ConversationListViewAction::OpenItem {
+            id: conversation_id,
+        });
+    })
+    .on_right_click({
+        let list_position_id = list_position_id.to_string();
+        move |ctx, _, position| {
+            let Some(parent_bounds) = ctx.element_position_by_id(&list_position_id) else {
+                return;
+            };
+            let offset = position - parent_bounds.origin();
+            ctx.dispatch_typed_action(ConversationListViewAction::ToggleOverflowMenu {
+                conversation_id,
+                position: Some(offset),
+            });
+        }
+    })
+    .with_defer_events_to_children()
+    .finish();
+
+    let position_id = conversation_item_position_id(&conversation_id);
+    let item_stack = Stack::new().with_child(
+        EventHandler::new(hoverable)
+            .on_mouse_in(
+                move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ConversationListViewAction::SetSelectedIndex(index));
+                    DispatchEventResult::PropagateToParent
+                },
+                Some(MouseInBehavior {
+                    fire_on_synthetic_events: false,
+                    fire_when_covered: true,
+                }),
+            )
+            .finish(),
+    );
+    SavePosition::new(item_stack.finish(), &position_id).finish()
 }

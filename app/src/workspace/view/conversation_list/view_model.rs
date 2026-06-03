@@ -5,27 +5,35 @@ use crate::ai::agent_conversations_model::{
     StatusFilter,
 };
 use crate::ai::ambient_agents::AmbientAgentTaskId;
+use crate::ai::cli_agent_session_scanner::{scan_cached, DiscoveredCLIAgentSession};
+use crate::terminal::CLIAgent;
 use fuzzy_match::match_indices_case_insensitive;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ConversationOrTaskId {
     ConversationId(AIConversationId),
     TaskId(AmbientAgentTaskId),
+    /// 第三方 CLI agent 的历史会话。
+    CLIAgentSession {
+        session_id: String,
+        agent_type: CLIAgent,
+    },
 }
 
 impl ConversationOrTaskId {
     pub fn conversation_id(&self) -> Option<AIConversationId> {
         match self {
             ConversationOrTaskId::ConversationId(id) => Some(*id),
-            ConversationOrTaskId::TaskId(_) => None,
+            ConversationOrTaskId::TaskId(_) | ConversationOrTaskId::CLIAgentSession { .. } => None,
         }
     }
 
     pub fn task_id(&self) -> Option<AmbientAgentTaskId> {
         match self {
             ConversationOrTaskId::TaskId(id) => Some(*id),
-            ConversationOrTaskId::ConversationId(_) => None,
+            ConversationOrTaskId::ConversationId(_)
+            | ConversationOrTaskId::CLIAgentSession { .. } => None,
         }
     }
 }
@@ -43,6 +51,8 @@ pub struct ConversationListViewModel {
     cached_conversation_or_task_ids: Vec<ConversationOrTaskId>,
     filtered_items: Vec<ConversationEntry>,
     search_query: String,
+    /// 已发现的第三方 CLI agent 会话。
+    cli_agent_sessions: Vec<DiscoveredCLIAgentSession>,
 }
 
 impl Entity for ConversationListViewModel {
@@ -55,43 +65,45 @@ impl ConversationListViewModel {
 
         ctx.subscribe_to_model(&conversations_model, |me, event, ctx| {
             match event {
-                // These events change the set of items in the list, so we need
-                // to rebuild the cached ID list.
                 AgentConversationsModelEvent::ConversationsLoaded
                 | AgentConversationsModelEvent::TasksUpdated
                 | AgentConversationsModelEvent::TaskManuallyOpened => {
                     me.refresh_cached_items(ctx);
                 }
-                // Status changes don't affect the set of IDs (status is read
-                // at render time via get_item_by_id); just signal a re-render.
                 AgentConversationsModelEvent::ConversationUpdated => {
                     ctx.emit(ConversationListViewModelEvent);
                 }
-                // Artifact updates don't affect the conversation list
                 AgentConversationsModelEvent::ConversationArtifactsUpdated { .. } => {}
             }
         });
+
+        // 非阻塞：首次调用触发后台扫描，立即返回空列表；后续调用返回缓存。
+        let cli_agent_sessions = scan_cached();
 
         let mut model = Self {
             conversations_model,
             cached_conversation_or_task_ids: Vec::new(),
             filtered_items: Vec::new(),
             search_query: String::new(),
+            cli_agent_sessions,
         };
         model.refresh_cached_items(ctx);
         model
     }
 
-    /// Rebuilds the cached list of IDs from the current task/conversation set.
-    ///
-    /// The cache stores only `ConversationOrTaskId`s; per-item fields like
-    /// status, title, and last-updated are read fresh at render time via
-    /// `get_item_by_id`. Callers should therefore avoid invoking this on
-    /// events that only mutate per-item state (e.g. `ConversationUpdated`);
-    /// emitting `ConversationListViewModelEvent` is sufficient there.
     fn refresh_cached_items(&mut self, ctx: &mut ModelContext<Self>) {
+        // 尝试重新读取缓存——后台扫描可能已经完成
+        let fresh_sessions = scan_cached();
+        if !fresh_sessions.is_empty()
+            && (self.cli_agent_sessions.is_empty()
+                || self.cli_agent_sessions.len() != fresh_sessions.len()
+                || self.cli_agent_sessions[0].id != fresh_sessions[0].id)
+        {
+            self.cli_agent_sessions = fresh_sessions;
+        }
+
         let model = self.conversations_model.as_ref(ctx);
-        self.cached_conversation_or_task_ids = model
+        let mut ids: Vec<ConversationOrTaskId> = model
             .get_tasks_and_conversations(
                 &AgentManagementFilters {
                     owners: OwnerFilter::PersonalOnly,
@@ -105,14 +117,10 @@ impl ConversationListViewModel {
                 },
                 ctx,
             )
-            // Expired and Unavailable ambient agent sessions can't be opened, so we filter them out.
-            // Regular conversations have None session_status
             .filter(|item| {
                 item.get_session_status()
                     .is_none_or(|status| status == SessionStatus::Available)
             })
-            // Only show user-initiated sources (Slack, Linear, Interactive) or tasks that have
-            // been manually opened from the management page.
             .filter(|item| {
                 let is_user_initiated = item.source().is_some_and(|s| s.is_user_initiated());
                 let is_manually_opened = match item {
@@ -129,6 +137,15 @@ impl ConversationListViewModel {
             })
             .collect();
 
+        // 追加第三方 CLI agent 会话
+        ids.extend(self.cli_agent_sessions.iter().map(|s| {
+            ConversationOrTaskId::CLIAgentSession {
+                session_id: s.id.clone(),
+                agent_type: s.agent_type,
+            }
+        }));
+
+        self.cached_conversation_or_task_ids = ids;
         self.apply_search_filter(ctx);
         ctx.emit(ConversationListViewModelEvent);
     }
@@ -137,7 +154,6 @@ impl ConversationListViewModel {
         if query == self.search_query {
             return;
         }
-
         self.search_query = query;
         self.apply_search_filter(ctx);
         ctx.emit(ConversationListViewModelEvent);
@@ -152,7 +168,7 @@ impl ConversationListViewModel {
                 .cached_conversation_or_task_ids
                 .iter()
                 .map(|id| ConversationEntry {
-                    id: *id,
+                    id: id.clone(),
                     highlight_indices: vec![],
                 })
                 .collect();
@@ -161,20 +177,28 @@ impl ConversationListViewModel {
                 .cached_conversation_or_task_ids
                 .iter()
                 .filter_map(|id| {
-                    let item = match id {
+                    let title = match id {
                         ConversationOrTaskId::TaskId(task_id) => {
-                            conversations_model.get_task(task_id)
+                            conversations_model.get_task(task_id)?.title(ctx)
                         }
                         ConversationOrTaskId::ConversationId(conv_id) => {
-                            conversations_model.get_conversation(conv_id)
+                            conversations_model.get_conversation(conv_id)?.title(ctx)
                         }
-                    }?;
+                        ConversationOrTaskId::CLIAgentSession {
+                            session_id, ..
+                        } => self
+                            .cli_agent_sessions
+                            .iter()
+                            .find(|s| &s.id == session_id)?
+                            .title
+                            .clone(),
+                    };
 
-                    match_indices_case_insensitive(&item.title(ctx), &search_query).map(|result| {
+                    match_indices_case_insensitive(&title, &search_query).map(|result| {
                         (
                             result.score,
                             ConversationEntry {
-                                id: *id,
+                                id: id.clone(),
                                 highlight_indices: result.matched_indices,
                             },
                         )
@@ -187,17 +211,15 @@ impl ConversationListViewModel {
         }
     }
 
-    /// Returns the total number of conversations in the model before any filtering is applied.
     pub fn unfiltered_item_count(&self) -> usize {
         self.cached_conversation_or_task_ids.len()
     }
 
-    /// Returns the filtered items with their highlight indices.
     pub fn filtered_items(&self) -> &[ConversationEntry] {
         &self.filtered_items
     }
 
-    /// Look up a conversation or task by ID.
+    /// 查找 Oz 对话/task。CLI agent 会话返回 None。
     pub fn get_item_by_id<'a>(
         &self,
         id: &ConversationOrTaskId,
@@ -207,7 +229,26 @@ impl ConversationListViewModel {
         match id {
             ConversationOrTaskId::TaskId(task_id) => model.get_task(task_id),
             ConversationOrTaskId::ConversationId(conv_id) => model.get_conversation(conv_id),
+            ConversationOrTaskId::CLIAgentSession { .. } => None,
         }
+    }
+
+    /// 查找 CLI agent 会话数据。
+    pub fn get_cli_agent_session(
+        &self,
+        id: &ConversationOrTaskId,
+    ) -> Option<&DiscoveredCLIAgentSession> {
+        match id {
+            ConversationOrTaskId::CLIAgentSession { session_id, .. } => {
+                self.cli_agent_sessions.iter().find(|s| &s.id == session_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// 判断 item 是否为 CLI agent 会话。
+    pub fn is_cli_agent_session(id: &ConversationOrTaskId) -> bool {
+        matches!(id, ConversationOrTaskId::CLIAgentSession { .. })
     }
 
     pub fn current_ids(&self) -> impl Iterator<Item = &ConversationOrTaskId> {
